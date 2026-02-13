@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
 
+import safari_session.session as safari_session_module
 from browser_use.browser.views import BrowserStateSummary
 from safari_session import SafariBrowserSession
 from safari_session.driver import SafariDriverConfig
@@ -34,6 +34,9 @@ async def test_start_initializes_shims_and_registers_handlers(monkeypatch: pytes
 		nonlocal start_calls
 		start_calls += 1
 
+	async def fake_driver_is_alive() -> bool:
+		return True
+
 	async def fake_refresh_tabs() -> list[Any]:
 		nonlocal refresh_tabs_calls
 		refresh_tabs_calls += 1
@@ -51,6 +54,7 @@ async def test_start_initializes_shims_and_registers_handlers(monkeypatch: pytes
 		load_calls += 1
 
 	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
 	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
 	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
 	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
@@ -85,6 +89,100 @@ async def test_start_initializes_shims_and_registers_handlers(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_start_activates_requested_safari_profile_window(monkeypatch: pytest.MonkeyPatch) -> None:
+	session = SafariBrowserSession(safari_profile_name='School')
+	calls: list[str] = []
+
+	async def fake_open_profile_window(profile_name: str, timeout_seconds: float = 6.0) -> str:
+		del timeout_seconds
+		calls.append(f'profile:{profile_name}')
+		return 'New School Window'
+
+	async def fake_driver_start() -> None:
+		calls.append('driver:start')
+
+	async def fake_driver_is_alive() -> bool:
+		return True
+
+	async def fake_refresh_tabs() -> list[Any]:
+		return []
+
+	async def fake_refresh_applescript_download_dir() -> None:
+		return None
+
+	async def fake_snapshot_download_files() -> dict[str, tuple[int, float]]:
+		return {}
+
+	async def fake_load_storage_state(self: SafariBrowserSession) -> None:
+		del self
+		return None
+
+	monkeypatch.setattr(safari_session_module, 'safari_open_profile_window', fake_open_profile_window)
+	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
+	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
+	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
+	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
+	monkeypatch.setattr(SafariBrowserSession, 'load_storage_state', fake_load_storage_state)
+
+	try:
+		await session.start()
+	finally:
+		await session.event_bus.stop(clear=True, timeout=5)
+
+	assert calls == ['profile:School', 'driver:start']
+	assert session._started is True
+	assert any(evt.startswith('profile:New School Window') for evt in session._recent_events)
+
+
+@pytest.mark.asyncio
+async def test_start_continues_when_requested_profile_window_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+	session = SafariBrowserSession(safari_profile_name='School')
+	driver_start_calls = 0
+
+	async def fake_open_profile_window(profile_name: str, timeout_seconds: float = 6.0) -> str:
+		del profile_name, timeout_seconds
+		raise RuntimeError('no matching profile')
+
+	async def fake_driver_start() -> None:
+		nonlocal driver_start_calls
+		driver_start_calls += 1
+
+	async def fake_driver_is_alive() -> bool:
+		return True
+
+	async def fake_refresh_tabs() -> list[Any]:
+		return []
+
+	async def fake_refresh_applescript_download_dir() -> None:
+		return None
+
+	async def fake_snapshot_download_files() -> dict[str, tuple[int, float]]:
+		return {}
+
+	async def fake_load_storage_state(self: SafariBrowserSession) -> None:
+		del self
+		return None
+
+	monkeypatch.setattr(safari_session_module, 'safari_open_profile_window', fake_open_profile_window)
+	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
+	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
+	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
+	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
+	monkeypatch.setattr(SafariBrowserSession, 'load_storage_state', fake_load_storage_state)
+
+	try:
+		await session.start()
+	finally:
+		await session.event_bus.stop(clear=True, timeout=5)
+
+	assert driver_start_calls == 1
+	assert session._started is True
+	assert any(evt.startswith('profile:failed:School') for evt in session._recent_events)
+
+
+@pytest.mark.asyncio
 async def test_start_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 	session = SafariBrowserSession()
 	start_calls = 0
@@ -92,6 +190,9 @@ async def test_start_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 	async def fake_driver_start() -> None:
 		nonlocal start_calls
 		start_calls += 1
+
+	async def fake_driver_is_alive() -> bool:
+		return True
 
 	async def fake_refresh_tabs() -> list[Any]:
 		return []
@@ -107,6 +208,7 @@ async def test_start_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 		return None
 
 	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
 	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
 	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
 	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
@@ -119,6 +221,111 @@ async def test_start_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 		await session.event_bus.stop(clear=True, timeout=5)
 
 	assert start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_start_retries_driver_when_profile_startup_is_not_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+	session = SafariBrowserSession(safari_profile_name='School')
+	start_calls = 0
+	close_calls = 0
+	is_alive_checks = 0
+
+	async def fake_open_profile_window(profile_name: str, timeout_seconds: float = 6.0) -> str:
+		del profile_name, timeout_seconds
+		return 'New School Window'
+
+	async def fake_driver_start() -> None:
+		nonlocal start_calls
+		start_calls += 1
+
+	async def fake_driver_close() -> None:
+		nonlocal close_calls
+		close_calls += 1
+
+	async def fake_driver_is_alive() -> bool:
+		nonlocal is_alive_checks
+		is_alive_checks += 1
+		# First check fails (triggers retry), second check succeeds.
+		return is_alive_checks >= 2
+
+	async def fake_refresh_tabs() -> list[Any]:
+		return []
+
+	async def fake_refresh_applescript_download_dir() -> None:
+		return None
+
+	async def fake_snapshot_download_files() -> dict[str, tuple[int, float]]:
+		return {}
+
+	async def fake_load_storage_state(self: SafariBrowserSession) -> None:
+		del self
+		return None
+
+	monkeypatch.setattr(safari_session_module, 'safari_open_profile_window', fake_open_profile_window)
+	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'close', fake_driver_close)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
+	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
+	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
+	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
+	monkeypatch.setattr(SafariBrowserSession, 'load_storage_state', fake_load_storage_state)
+
+	try:
+		await session.start()
+	finally:
+		await session.event_bus.stop(clear=True, timeout=5)
+
+	assert start_calls == 2
+	assert close_calls == 1
+	assert session._started is True
+
+
+@pytest.mark.asyncio
+async def test_start_recovers_when_profile_startup_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+	session = SafariBrowserSession(safari_profile_name='School')
+	start_calls = 0
+
+	async def fake_open_profile_window(profile_name: str, timeout_seconds: float = 6.0) -> str:
+		del profile_name, timeout_seconds
+		return 'New School Window'
+
+	async def fake_driver_start() -> None:
+		nonlocal start_calls
+		start_calls += 1
+		if start_calls == 1:
+			raise RuntimeError('startup hang')
+
+	async def fake_driver_is_alive() -> bool:
+		return True
+
+	async def fake_refresh_tabs() -> list[Any]:
+		return []
+
+	async def fake_refresh_applescript_download_dir() -> None:
+		return None
+
+	async def fake_snapshot_download_files() -> dict[str, tuple[int, float]]:
+		return {}
+
+	async def fake_load_storage_state(self: SafariBrowserSession) -> None:
+		del self
+		return None
+
+	monkeypatch.setattr(safari_session_module, 'safari_open_profile_window', fake_open_profile_window)
+	monkeypatch.setattr(session.driver, 'start', fake_driver_start)
+	monkeypatch.setattr(session.driver, 'is_alive', fake_driver_is_alive)
+	monkeypatch.setattr(session, '_refresh_tabs', fake_refresh_tabs)
+	monkeypatch.setattr(session, '_refresh_applescript_download_dir', fake_refresh_applescript_download_dir)
+	monkeypatch.setattr(session, '_snapshot_download_files', fake_snapshot_download_files)
+	monkeypatch.setattr(SafariBrowserSession, 'load_storage_state', fake_load_storage_state)
+
+	try:
+		await session.start()
+	finally:
+		await session.event_bus.stop(clear=True, timeout=5)
+
+	assert start_calls == 2
+	assert session._started is True
 
 
 @pytest.mark.asyncio

@@ -48,9 +48,7 @@ async def test_navigate_new_tab_falls_back_to_applescript_on_webdriver_failure(m
 		assert timeout_seconds == 12.0
 		return 'complete'
 
-	async def fake_dismiss_dialogs_after_navigation(
-		max_wait_seconds: float = 0.8, poll_interval_seconds: float = 0.15
-	) -> bool:
+	async def fake_dismiss_dialogs_after_navigation(max_wait_seconds: float = 0.8, poll_interval_seconds: float = 0.15) -> bool:
 		del max_wait_seconds, poll_interval_seconds
 		nonlocal dialog_poll_calls
 		dialog_poll_calls += 1

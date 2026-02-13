@@ -109,9 +109,7 @@ async def test_navigate_event_invokes_dialog_dismissal(monkeypatch: pytest.Monke
 	async def fake_refresh_tabs() -> list[TabInfo]:
 		return [TabInfo(url='https://example.com', title='Example', target_id='safari-target', parent_target_id=None)]
 
-	async def fake_dismiss_dialogs_after_navigation(
-		max_wait_seconds: float = 0.8, poll_interval_seconds: float = 0.15
-	) -> bool:
+	async def fake_dismiss_dialogs_after_navigation(max_wait_seconds: float = 0.8, poll_interval_seconds: float = 0.15) -> bool:
 		del max_wait_seconds, poll_interval_seconds
 		nonlocal dismiss_called
 		dismiss_called = True

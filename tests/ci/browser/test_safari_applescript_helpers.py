@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from typing import Any
 
 import pytest
@@ -60,6 +61,57 @@ async def test_safari_show_downloads_ui_returns_true_on_success(monkeypatch: pyt
 	monkeypatch.setattr(applescript_module, 'run_applescript', fake_run_applescript)
 	shown = await applescript_module.safari_show_downloads_ui()
 	assert shown is True
+
+
+@pytest.mark.asyncio
+async def test_safari_get_file_menu_items_filters_missing_values(monkeypatch: pytest.MonkeyPatch) -> None:
+	"""File-menu helper should skip separators represented as `missing value`."""
+
+	async def fake_run_applescript(script: str, timeout_seconds: float = 5.0) -> AppleScriptResult:
+		del script, timeout_seconds
+		return AppleScriptResult(
+			stdout='New Personal Window\nmissing value\nNew School Window\n',
+			stderr='',
+			return_code=0,
+		)
+
+	monkeypatch.setattr(applescript_module, 'run_applescript', fake_run_applescript)
+	items = await applescript_module.safari_get_file_menu_items()
+	assert items == ['New Personal Window', 'New School Window']
+
+
+@pytest.mark.asyncio
+async def test_safari_open_profile_window_clicks_matching_file_menu_item(monkeypatch: pytest.MonkeyPatch) -> None:
+	"""Profile-window helper should match and click the corresponding File menu item."""
+	clicked: list[str] = []
+
+	async def fake_get_file_menu_items(timeout_seconds: float = 5.0) -> list[str]:
+		del timeout_seconds
+		return ['New Personal Window', 'New School Window', 'New Private Window']
+
+	async def fake_click_file_menu_item(item_name: str, timeout_seconds: float = 5.0) -> bool:
+		del timeout_seconds
+		clicked.append(item_name)
+		return True
+
+	monkeypatch.setattr(applescript_module, 'safari_get_file_menu_items', fake_get_file_menu_items)
+	monkeypatch.setattr(applescript_module, 'safari_click_file_menu_item', fake_click_file_menu_item)
+	selected = await applescript_module.safari_open_profile_window('school')
+	assert selected == 'New School Window'
+	assert clicked == ['New School Window']
+
+
+@pytest.mark.asyncio
+async def test_safari_open_profile_window_raises_for_unknown_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+	"""Profile-window helper should raise with available options when no match exists."""
+
+	async def fake_get_file_menu_items(timeout_seconds: float = 5.0) -> list[str]:
+		del timeout_seconds
+		return ['New Personal Window', 'New School Window', 'New Private Window']
+
+	monkeypatch.setattr(applescript_module, 'safari_get_file_menu_items', fake_get_file_menu_items)
+	with pytest.raises(RuntimeError, match='Available profile windows'):
+		await applescript_module.safari_open_profile_window('Work')
 
 
 @pytest.mark.asyncio
@@ -186,10 +238,11 @@ async def test_run_applescript_wraps_subprocess_result(monkeypatch: pytest.Monke
 			self.stderr = stderr
 			self.returncode = returncode
 
-	def fake_run(cmd: list[str], capture_output: bool, text: bool) -> Any:
+	def fake_run(cmd: list[str], capture_output: bool, text: bool, timeout: float) -> Any:
 		assert cmd[0] == 'osascript'
 		assert capture_output is True
 		assert text is True
+		assert timeout == 10.0
 		return _Completed(stdout=' out \n', stderr=' err \n', returncode=7)
 
 	monkeypatch.setattr(applescript_module.subprocess, 'run', fake_run)
@@ -197,3 +250,16 @@ async def test_run_applescript_wraps_subprocess_result(monkeypatch: pytest.Monke
 	assert result.stdout == 'out'
 	assert result.stderr == 'err'
 	assert result.return_code == 7
+
+
+@pytest.mark.asyncio
+async def test_run_applescript_raises_timeout_error(monkeypatch: pytest.MonkeyPatch) -> None:
+	"""run_applescript should raise TimeoutError when osascript exceeds timeout."""
+
+	def fake_run(cmd: list[str], capture_output: bool, text: bool, timeout: float) -> Any:
+		del cmd, capture_output, text, timeout
+		raise subprocess.TimeoutExpired(cmd='osascript', timeout=1.0)
+
+	monkeypatch.setattr(applescript_module.subprocess, 'run', fake_run)
+	with pytest.raises(TimeoutError, match='AppleScript timed out'):
+		await applescript_module.run_applescript('return "x"', timeout_seconds=1.0)

@@ -145,11 +145,11 @@ async def create_browser_session(
 
 		from safari_session import SafariBrowserSession
 
-		if profile:
-			logger.warning('Safari mode ignores --profile; Safari WebDriver uses Safari automation context')
 		if not headed:
 			logger.info('Safari mode is always headed; ignoring headless request')
-		return cast(BrowserSession, SafariBrowserSession())
+		if profile:
+			logger.info(f'Safari mode requested profile window: {profile}')
+		return cast(BrowserSession, SafariBrowserSession(safari_profile_name=profile))
 
 	else:
 		raise ValueError(f'Unknown browser mode: {mode}')

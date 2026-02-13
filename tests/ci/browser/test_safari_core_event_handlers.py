@@ -257,9 +257,7 @@ async def test_upload_file_event_uses_css_selector_when_available(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_upload_file_event_falls_back_to_xpath_when_css_missing(
-	monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_upload_file_event_falls_back_to_xpath_when_css_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 	session = SafariBrowserSession()
 	upload_calls: list[tuple[str, str, str]] = []
 	file_path = str(tmp_path / 'photo.png')
@@ -293,9 +291,7 @@ async def test_upload_file_event_falls_back_to_xpath_when_css_missing(
 
 
 @pytest.mark.asyncio
-async def test_upload_file_event_raises_when_element_has_no_selectors(
-	monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+async def test_upload_file_event_raises_when_element_has_no_selectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 	session = SafariBrowserSession()
 	file_path = str(tmp_path / 'data.csv')
 
@@ -441,9 +437,7 @@ async def test_select_dropdown_option_returns_structured_result(
 	monkeypatch.setattr(session.driver, 'execute_js', fake_execute_js)
 
 	try:
-		result = await session.on_SelectDropdownOptionEvent(
-			SelectDropdownOptionEvent(node=_make_node(21), text='USA')
-		)
+		result = await session.on_SelectDropdownOptionEvent(SelectDropdownOptionEvent(node=_make_node(21), text='USA'))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 

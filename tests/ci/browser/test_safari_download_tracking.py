@@ -114,9 +114,7 @@ async def test_download_tracking_uses_applescript_recent_downloads_fallback(
 
 
 @pytest.mark.asyncio
-async def test_download_tracking_ignores_show_downloads_ui_exception(
-	tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_download_tracking_ignores_show_downloads_ui_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 	"""Download tracking should still use recent-download fallback when downloads UI trigger fails."""
 	session = SafariBrowserSession()
 	try:

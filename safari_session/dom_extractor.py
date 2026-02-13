@@ -47,7 +47,7 @@ class SafariDOMExtractionResult(BaseModel):
 
 
 EXTRACTION_SCRIPT = r"""
-(() => {
+return (() => {
 	const MAX = Math.max(1, Math.min(Number(arguments[0] ?? 400), 2000));
 
 	const selectors = [

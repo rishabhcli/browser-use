@@ -278,9 +278,7 @@ async def test_runtime_evaluate_await_promise_success_and_failure(monkeypatch: p
 	monkeypatch.setattr(session.driver, 'execute_async_js', fake_execute_async_js_ok)
 
 	try:
-		ok = await session.cdp_client.send.Runtime.evaluate(
-			{'expression': 'Promise.resolve(5)', 'awaitPromise': True}
-		)
+		ok = await session.cdp_client.send.Runtime.evaluate({'expression': 'Promise.resolve(5)', 'awaitPromise': True})
 		assert ok['result']['value'] == 5
 
 		async def fake_execute_async_js_fail(expression: str, *args: Any) -> dict[str, Any]:
@@ -288,9 +286,7 @@ async def test_runtime_evaluate_await_promise_success_and_failure(monkeypatch: p
 			return {'ok': False, 'error': 'promise rejected'}
 
 		monkeypatch.setattr(session.driver, 'execute_async_js', fake_execute_async_js_fail)
-		failed = await session.cdp_client.send.Runtime.evaluate(
-			{'expression': 'Promise.reject()', 'awaitPromise': True}
-		)
+		failed = await session.cdp_client.send.Runtime.evaluate({'expression': 'Promise.reject()', 'awaitPromise': True})
 		assert failed['result']['type'] == 'undefined'
 		assert failed['exceptionDetails']['text'] == 'promise rejected'
 	finally:

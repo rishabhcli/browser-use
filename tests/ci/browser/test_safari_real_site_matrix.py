@@ -55,6 +55,19 @@ async def test_safari_real_site_matrix(url: str, expected_hint: str) -> None:
 		await session.navigate(url)
 		state = await session.get_browser_state_summary(include_screenshot=False)
 
+		# Some sites (notably Amazon) can serve AWS WAF bot-challenge pages that
+		# intentionally have empty title/DOM content until a token handshake succeeds.
+		# Treat those as environmental skips, not Safari integration regressions.
+		if 'amazon.com' in url:
+			challenge_marker = await session.driver.execute_js(
+				"""
+				const html = document.documentElement ? document.documentElement.outerHTML : '';
+				return html.includes('token.awswaf.com') || html.includes('challenge-container');
+				"""
+			)
+			if challenge_marker:
+				pytest.skip('Amazon returned AWS WAF challenge page; skipping non-deterministic anti-bot response.')
+
 		# Basic health checks for each site in the matrix.
 		assert state.url
 		assert state.title is not None

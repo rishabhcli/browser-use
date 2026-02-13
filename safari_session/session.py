@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -52,6 +53,7 @@ from safari_session.applescript import (
 	safari_get_downloads_folder,
 	safari_get_tabs,
 	safari_list_recent_downloads,
+	safari_open_profile_window,
 	safari_open_tab,
 	safari_show_downloads_ui,
 	safari_switch_tab,
@@ -252,6 +254,7 @@ class SafariBrowserSession(BaseModel):
 	event_bus: EventBus = Field(default_factory=lambda: EventBus(name=f'SafariBrowser_{uuid7str()[-4:]}'))
 	is_local: bool = True
 	cdp_url: str | None = None
+	safari_profile_name: str | None = None
 	agent_focus_target_id: str | None = None
 	llm_screenshot_size: tuple[int, int] | None = None
 	session_manager: Any | None = None
@@ -342,9 +345,43 @@ class SafariBrowserSession(BaseModel):
 		self.event_bus.on(FileDownloadedEvent, self.on_FileDownloadedEvent)
 		self._handlers_registered = True
 
-	async def _with_retry(
-		self, operation_name: str, operation, retries: int = 2, check_driver_alive: bool = True
-	) -> Any:
+	def _is_stale_pairing_error(self, exc: Exception) -> bool:
+		error_text = str(exc).lower()
+		return (
+			'already paired with another webdriver session' in error_text
+			or 'already paired with a different session' in error_text
+			or 'automation session ended unexpected while attempting to pair' in error_text
+		)
+
+	async def _reset_stale_safaridriver_process(self) -> None:
+		"""Best-effort cleanup for stale local safaridriver pairings."""
+		try:
+			await asyncio.to_thread(
+				subprocess.run,
+				['pkill', '-f', 'safaridriver'],
+				check=False,
+				capture_output=True,
+				text=True,
+			)
+		except Exception as exc:
+			self.logger.debug(f'Failed to reset stale safaridriver process: {exc}')
+			return
+		await asyncio.sleep(0.4)
+
+	async def _start_driver_with_pairing_recovery(self, timeout_seconds: float) -> None:
+		"""Start SafariDriver and recover once from stale pairing failures."""
+		try:
+			await asyncio.wait_for(self.driver.start(), timeout=timeout_seconds)
+			return
+		except Exception as exc:
+			if not self._is_stale_pairing_error(exc):
+				raise
+			self.logger.warning(f'Detected stale Safari WebDriver pairing: {exc}. Resetting and retrying once')
+			await self._reset_stale_safaridriver_process()
+			self.driver._driver = None
+			await asyncio.wait_for(self.driver.start(), timeout=timeout_seconds)
+
+	async def _with_retry(self, operation_name: str, operation, retries: int = 2, check_driver_alive: bool = True) -> Any:
 		last_error: Exception | None = None
 		for attempt in range(retries + 1):
 			try:
@@ -1140,7 +1177,51 @@ class SafariBrowserSession(BaseModel):
 	async def start(self) -> None:
 		if self._started:
 			return
-		await self.driver.start()
+		profile_activation_error: Exception | None = None
+		driver_start_error: Exception | None = None
+		if self.safari_profile_name:
+			try:
+				selected_item = await safari_open_profile_window(self.safari_profile_name, timeout_seconds=6.0)
+				self._append_recent_event(f'profile:{selected_item}')
+			except Exception as exc:
+				profile_activation_error = exc
+				self.logger.warning(f'Failed to activate Safari profile "{self.safari_profile_name}": {exc}')
+				self._append_recent_event(f'profile:failed:{self.safari_profile_name}')
+		if self.safari_profile_name:
+			start_timeout = min(float(self.driver.config.command_timeout), 20.0)
+			try:
+				await self._start_driver_with_pairing_recovery(timeout_seconds=start_timeout)
+			except Exception as exc:
+				driver_start_error = exc
+				self.logger.warning(
+					f'Safari WebDriver startup after profile activation failed: {exc}. Retrying with default Safari context'
+				)
+				self.driver._driver = None
+				await self._start_driver_with_pairing_recovery(timeout_seconds=start_timeout)
+		else:
+			await self._start_driver_with_pairing_recovery(timeout_seconds=float(self.driver.config.command_timeout))
+		if not await self.driver.is_alive():
+			if self.safari_profile_name:
+				self.logger.warning(
+					'Safari WebDriver is not alive after profile activation; retrying with default Safari context'
+				)
+				retry_timeout = min(float(self.driver.config.command_timeout), 15.0)
+				original_timeout = float(self.driver.config.command_timeout)
+				self.driver.config.command_timeout = retry_timeout
+				try:
+					try:
+						await asyncio.wait_for(self.driver.close(), timeout=retry_timeout)
+					except Exception:
+						# If close hangs or fails, clear local handle and force a fresh start attempt.
+						self.driver._driver = None
+					if self.driver._driver is not None:
+						self.driver._driver = None
+					await self._start_driver_with_pairing_recovery(timeout_seconds=retry_timeout)
+				finally:
+					self.driver.config.command_timeout = original_timeout
+			if not await self.driver.is_alive():
+				profile_suffix = f' (requested profile: {self.safari_profile_name})' if self.safari_profile_name else ''
+				raise RuntimeError(f'Safari WebDriver session is not alive after startup{profile_suffix}')
 		self._dom_watchdog = _SafariDOMWatchdogShim(self)
 		self._cdp_shim = _CDPClientShim(self)
 		self._cdp_client_root = self._cdp_shim
@@ -1151,6 +1232,14 @@ class SafariBrowserSession(BaseModel):
 		self._download_snapshot = await self._snapshot_download_files()
 		await self.load_storage_state()
 		self._started = True
+		if profile_activation_error is not None:
+			self.logger.warning(
+				f'Safari session started without profile switch "{self.safari_profile_name}"; default context is active'
+			)
+		if driver_start_error is not None:
+			self.logger.warning(
+				f'Safari session recovered after profile startup failure "{self.safari_profile_name}"; default context is active'
+			)
 
 	@validate_call
 	async def stop(self) -> None:

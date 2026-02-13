@@ -1,6 +1,5 @@
 """Tests for Safari browser-state fallback behavior."""
 
-
 import pytest
 
 from browser_use.browser.events import BrowserStateRequestEvent
@@ -71,9 +70,7 @@ async def test_browser_state_uses_cached_dom_on_extraction_failure(monkeypatch: 
 	)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
@@ -128,9 +125,7 @@ async def test_browser_state_uses_cached_page_info_on_metrics_failure(monkeypatc
 	)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
@@ -176,9 +171,7 @@ async def test_browser_state_defaults_page_info_when_metrics_fail_without_cache(
 	monkeypatch.setattr(session, '_compute_page_info', failing_page_info)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
@@ -328,9 +321,7 @@ async def test_browser_state_uses_cached_url_title_tabs_when_metadata_reads_fail
 	async def fake_page_info() -> PageInfo:
 		return _build_page_info()
 
-	cached_tabs = [
-		TabInfo(url='https://cached.example', title='Cached tab', target_id='cached-target', parent_target_id=None)
-	]
+	cached_tabs = [TabInfo(url='https://cached.example', title='Cached tab', target_id='cached-target', parent_target_id=None)]
 	session._cached_browser_state_summary = BrowserStateSummary(
 		dom_state=SerializedDOMState(_root=None, selector_map={}),
 		url='https://cached.example',
@@ -349,9 +340,7 @@ async def test_browser_state_uses_cached_url_title_tabs_when_metadata_reads_fail
 	monkeypatch.setattr(session, '_compute_page_info', fake_page_info)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
@@ -401,9 +390,7 @@ async def test_browser_state_creates_fallback_tab_when_tab_refresh_fails_without
 	monkeypatch.setattr(session, '_compute_page_info', fake_page_info)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
@@ -450,9 +437,7 @@ async def test_browser_state_download_tracking_failure_is_non_fatal(monkeypatch:
 	monkeypatch.setattr(session, '_compute_page_info', fake_page_info)
 
 	try:
-		summary = await session.on_BrowserStateRequestEvent(
-			BrowserStateRequestEvent(include_dom=True, include_screenshot=False)
-		)
+		summary = await session.on_BrowserStateRequestEvent(BrowserStateRequestEvent(include_dom=True, include_screenshot=False))
 	finally:
 		await session.event_bus.stop(clear=True, timeout=5)
 
