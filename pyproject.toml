@@ -2,7 +2,7 @@
 name = "browser-use"
 description = "Make websites accessible for AI agents"
 authors = [{ name = "Gregor Zunic" }]
-version = "0.11.10a1"
+version = "0.11.9"
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 classifiers = [
@@ -42,6 +42,7 @@ dependencies = [
     "pypdf>=5.7.0",
     "reportlab>=4.0.0",
     "cdp-use>=1.4.4",
+    "selenium>=4.37.0",
     "pyotp>=2.9.0",
     "pillow>=11.2.1",
     "cloudpickle>=3.1.1",
@@ -134,7 +135,7 @@ skip-magic-trailing-comma = false
 
 [tool.pyright]
 typeCheckingMode = "basic"
-include = ["browser_use", "examples", "tests"]
+include = ["browser_use", "examples", "tests", "safari_session"]
 exclude = [
     ".venv/",
     ".venv*/",
@@ -164,6 +165,7 @@ reportMissingTypeStubs = false
 [tool.hatch.build]
 include = [
     "browser_use/**/*.py",
+    "safari_session/**/*.py",
     "!browser_use/**/tests/*.py",
     "!browser_use/**/tests.py",
 	"browser_use/agent/system_prompts/*.md",
@@ -211,7 +213,9 @@ allow-direct-references = true
 #     "sys_platform == 'win32' and platform_machine == 'x86_64'",
 #     # "sys_platform == 'win32' and platform_machine == 'arm64'",  # no pytorch wheels available yet
 # ]
-dev-dependencies = [
+
+[dependency-groups]
+dev = [
     "ruff>=0.11.2",
     "tokencost>=0.1.16",
     "build>=1.2.2",

@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import anyio
+
 from browser_use.skill_cli.sessions import SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,23 @@ async def _execute_js(session: SessionInfo, js: str) -> Any:
 async def _get_element_center(session: SessionInfo, node: Any) -> tuple[float, float] | None:
 	"""Get the center coordinates of an element."""
 	bs = session.browser_session
+
+	# Safari adapter already carries absolute positions in the DOM node.
+	absolute_position = getattr(node, 'absolute_position', None)
+	if absolute_position is not None:
+		try:
+			x = float(getattr(absolute_position, 'x', 0.0))
+			y = float(getattr(absolute_position, 'y', 0.0))
+			width = float(getattr(absolute_position, 'width', 0.0))
+			height = float(getattr(absolute_position, 'height', 0.0))
+			if width > 0 and height > 0:
+				return x + width / 2, y + height / 2
+		except Exception:
+			pass
+
+	if not hasattr(bs, 'cdp_client_for_node') or not hasattr(bs, 'get_element_coordinates'):
+		return None
+
 	try:
 		cdp_session = await bs.cdp_client_for_node(node)
 		session_id = cdp_session.session_id
@@ -111,15 +130,51 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		return {'clicked': index}
 
 	elif action == 'type':
-		# Type into currently focused element using CDP directly
 		text = params['text']
-		cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
-		if not cdp_session:
-			return {'error': 'No active browser session'}
-		await cdp_session.cdp_client.send.Input.insertText(
-			params={'text': text},
-			session_id=cdp_session.session_id,
-		)
+		try:
+			# CDP-first path for Chromium sessions.
+			cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
+			if not cdp_session:
+				return {'error': 'No active browser session'}
+			await cdp_session.cdp_client.send.Input.insertText(
+				params={'text': text},
+				session_id=cdp_session.session_id,
+			)
+		except Exception:
+			# Safari fallback: write into active element using injected JS.
+			import json as json_module
+
+			inserted = await _execute_js(
+				session,
+				f"""
+				(function() {{
+					const text = {json_module.dumps(text)};
+					const el = document.activeElement;
+					if (!el) return false;
+					const tag = (el.tagName || '').toLowerCase();
+					const isTextLike =
+						tag === 'textarea' ||
+						(tag === 'input' && !['checkbox', 'radio', 'submit', 'button', 'file'].includes((el.type || '').toLowerCase())) ||
+						el.isContentEditable;
+					if (!isTextLike) return false;
+					if (el.isContentEditable) {{
+						el.textContent = (el.textContent || '') + text;
+					}} else {{
+						const start = typeof el.selectionStart === 'number' ? el.selectionStart : (el.value || '').length;
+						const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : (el.value || '').length;
+						const value = el.value || '';
+						el.value = value.slice(0, start) + text + value.slice(end);
+						const next = start + text.length;
+						if (typeof el.setSelectionRange === 'function') el.setSelectionRange(next, next);
+					}}
+					el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+					el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+					return true;
+				}})()
+				""",
+			)
+			if not inserted:
+				return {'error': 'No active text input is focused'}
 		return {'typed': text}
 
 	elif action == 'input':
@@ -154,7 +209,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 		if params.get('path'):
 			path = Path(params['path'])
-			path.write_bytes(data)
+			await anyio.Path(str(path)).write_bytes(data)
 			return {'saved': str(path), 'size': len(data)}
 
 		# Return base64 encoded
@@ -169,8 +224,12 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		from browser_use.browser.events import SwitchTabEvent
 
 		tab_index = params['tab']
-		# Get target_id from tab index
-		page_targets = bs.session_manager.get_all_page_targets() if bs.session_manager else []
+		if bs.session_manager:
+			page_targets = bs.session_manager.get_all_page_targets()
+		elif hasattr(bs, 'get_tabs'):
+			page_targets = await bs.get_tabs()
+		else:
+			page_targets = []
 		if tab_index < 0 or tab_index >= len(page_targets):
 			return {'error': f'Invalid tab index {tab_index}. Available: 0-{len(page_targets) - 1}'}
 		target_id = page_targets[tab_index].target_id
@@ -181,8 +240,12 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		from browser_use.browser.events import CloseTabEvent
 
 		tab_index = params.get('tab')
-		# Get target_id from tab index
-		page_targets = bs.session_manager.get_all_page_targets() if bs.session_manager else []
+		if bs.session_manager:
+			page_targets = bs.session_manager.get_all_page_targets()
+		elif hasattr(bs, 'get_tabs'):
+			page_targets = await bs.get_tabs()
+		else:
+			page_targets = []
 		if tab_index is not None:
 			if tab_index < 0 or tab_index >= len(page_targets):
 				return {'error': f'Invalid tab index {tab_index}. Available: 0-{len(page_targets) - 1}'}
@@ -190,6 +253,10 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		else:
 			# Close current/focused tab
 			target_id = bs.session_manager.get_focused_target().target_id if bs.session_manager else None
+			if target_id is None and hasattr(bs, 'agent_focus_target_id'):
+				target_id = bs.agent_focus_target_id
+			if target_id is None and page_targets:
+				target_id = page_targets[-1].target_id
 			if not target_id:
 				return {'error': 'No focused tab to close'}
 		await bs.event_bus.dispatch(CloseTabEvent(target_id=target_id))
@@ -237,11 +304,32 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			return {'error': 'Could not get element coordinates for hover'}
 
 		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=cdp_session.session_id,
-		)
+		if hasattr(bs, 'cdp_client_for_node'):
+			cdp_session = await bs.cdp_client_for_node(node)
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+				session_id=cdp_session.session_id,
+			)
+		else:
+			hovered = await _execute_js(
+				session,
+				f"""
+				(function() {{
+					const el = document.elementFromPoint({center_x}, {center_y});
+					if (!el) return false;
+					const ev = new MouseEvent('mousemove', {{
+						bubbles: true,
+						cancelable: true,
+						clientX: {center_x},
+						clientY: {center_y},
+					}});
+					el.dispatchEvent(ev);
+					return true;
+				}})()
+				""",
+			)
+			if not hovered:
+				return {'error': 'Could not dispatch hover event'}
 		return {'hovered': index}
 
 	elif action == 'dblclick':
@@ -255,39 +343,46 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			return {'error': 'Could not get element coordinates for double-click'}
 
 		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		session_id = cdp_session.session_id
+		if hasattr(bs, 'cdp_client_for_node'):
+			cdp_session = await bs.cdp_client_for_node(node)
+			session_id = cdp_session.session_id
 
-		# Move mouse to element
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
+			# Move mouse to element
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
 
-		# Double click (clickCount: 2)
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mousePressed',
-				'x': center_x,
-				'y': center_y,
-				'button': 'left',
-				'clickCount': 2,
-			},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
+			# Double click (clickCount: 2)
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={
+					'type': 'mousePressed',
+					'x': center_x,
+					'y': center_y,
+					'button': 'left',
+					'clickCount': 2,
+				},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
 
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mouseReleased',
-				'x': center_x,
-				'y': center_y,
-				'button': 'left',
-				'clickCount': 2,
-			},
-			session_id=session_id,
-		)
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={
+					'type': 'mouseReleased',
+					'x': center_x,
+					'y': center_y,
+					'button': 'left',
+					'clickCount': 2,
+				},
+				session_id=session_id,
+			)
+		else:
+			from browser_use.browser.events import ClickCoordinateEvent
+
+			await bs.event_bus.dispatch(ClickCoordinateEvent(coordinate_x=int(center_x), coordinate_y=int(center_y)))
+			await asyncio.sleep(0.05)
+			await bs.event_bus.dispatch(ClickCoordinateEvent(coordinate_x=int(center_x), coordinate_y=int(center_y)))
 		return {'double_clicked': index}
 
 	elif action == 'rightclick':
@@ -301,47 +396,74 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			return {'error': 'Could not get element coordinates for right-click'}
 
 		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		session_id = cdp_session.session_id
+		if hasattr(bs, 'cdp_client_for_node'):
+			cdp_session = await bs.cdp_client_for_node(node)
+			session_id = cdp_session.session_id
 
-		# Move mouse to element
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
+			# Move mouse to element
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
 
-		# Right click (button: 'right')
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mousePressed',
-				'x': center_x,
-				'y': center_y,
-				'button': 'right',
-				'clickCount': 1,
-			},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
+			# Right click (button: 'right')
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={
+					'type': 'mousePressed',
+					'x': center_x,
+					'y': center_y,
+					'button': 'right',
+					'clickCount': 1,
+				},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.05)
 
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mouseReleased',
-				'x': center_x,
-				'y': center_y,
-				'button': 'right',
-				'clickCount': 1,
-			},
-			session_id=session_id,
-		)
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={
+					'type': 'mouseReleased',
+					'x': center_x,
+					'y': center_y,
+					'button': 'right',
+					'clickCount': 1,
+				},
+				session_id=session_id,
+			)
+		else:
+			right_clicked = await _execute_js(
+				session,
+				f"""
+				(function() {{
+					const el = document.elementFromPoint({center_x}, {center_y});
+					if (!el) return false;
+					const ev = new MouseEvent('contextmenu', {{
+						bubbles: true,
+						cancelable: true,
+						clientX: {center_x},
+						clientY: {center_y},
+						button: 2,
+					}});
+					el.dispatchEvent(ev);
+					return true;
+				}})()
+				""",
+			)
+			if not right_clicked:
+				return {'error': 'Could not dispatch right-click event'}
 		return {'right_clicked': index}
 
 	elif action == 'cookies':
 		cookies_command = params.get('cookies_command')
 
 		if cookies_command == 'get':
-			# Get cookies via direct CDP
-			cookies = await bs._cdp_get_cookies()
+			if hasattr(bs, '_cdp_get_cookies'):
+				# Get cookies via direct CDP
+				cookies = await bs._cdp_get_cookies()
+			elif hasattr(bs, 'cookies'):
+				cookies = await bs.cookies()
+			else:
+				return {'error': 'Cookie retrieval not supported for this browser backend'}
 			# Convert Cookie objects to dicts
 			cookie_list: list[dict[str, Any]] = []
 			for c in cookies:
@@ -376,8 +498,6 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			return {'cookies': cookie_list}
 
 		elif cookies_command == 'set':
-			from cdp_use.cdp.network import Cookie
-
 			cookie_dict: dict[str, Any] = {
 				'name': params['name'],
 				'value': params['value'],
@@ -400,8 +520,17 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 					cookie_dict['domain'] = hostname
 
 			try:
-				cookie_obj = Cookie(**cookie_dict)
-				await bs._cdp_set_cookies([cookie_obj])
+				if hasattr(bs, '_cdp_set_cookies'):
+					from cdp_use.cdp.network import Cookie
+
+					cookie_obj = Cookie(**cookie_dict)
+					await bs._cdp_set_cookies([cookie_obj])
+				else:
+					driver = getattr(bs, 'driver', None)
+					if driver is not None and hasattr(driver, 'set_cookie'):
+						await driver.set_cookie(cookie_dict)
+					else:
+						return {'set': params['name'], 'success': False, 'error': 'Cookie setting is not supported'}
 				return {'set': params['name'], 'success': True}
 			except Exception as e:
 				logger.error(f'Failed to set cookie: {e}')
@@ -409,7 +538,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 		elif cookies_command == 'clear':
 			url = params.get('url')
-			if url:
+			if url and hasattr(bs, '_cdp_get_cookies'):
 				# Clear cookies only for specific URL domain
 				from urllib.parse import urlparse
 
@@ -430,17 +559,29 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 								},
 								session_id=cdp_session.session_id,
 							)
+			elif url:
+				return {'error': 'Domain-scoped cookie clear requires a CDP-capable browser backend'}
 			else:
 				# Clear all cookies
-				await bs._cdp_clear_cookies()
+				if hasattr(bs, '_cdp_clear_cookies'):
+					await bs._cdp_clear_cookies()
+				elif hasattr(bs, 'clear_cookies'):
+					await bs.clear_cookies()
+				else:
+					return {'error': 'Cookie clear is not supported for this browser backend'}
 
 			return {'cleared': True, 'url': url}
 
 		elif cookies_command == 'export':
 			import json
 
-			# Get cookies via direct CDP
-			cookies = await bs._cdp_get_cookies()
+			if hasattr(bs, '_cdp_get_cookies'):
+				# Get cookies via direct CDP
+				cookies = await bs._cdp_get_cookies()
+			elif hasattr(bs, 'cookies'):
+				cookies = await bs.cookies()
+			else:
+				return {'error': 'Cookie export is not supported for this browser backend'}
 			# Convert to list of dicts
 			cookie_list: list[dict[str, Any]] = []
 			for c in cookies:
@@ -473,49 +614,64 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				]
 
 			file_path = Path(params['file'])
-			file_path.write_text(json.dumps(cookie_list, indent=2))
+			await anyio.Path(str(file_path)).write_text(json.dumps(cookie_list, indent=2))
 			return {'exported': len(cookie_list), 'file': str(file_path)}
 
 		elif cookies_command == 'import':
 			import json
 
 			file_path = Path(params['file'])
-			if not file_path.exists():
+			async_file_path = anyio.Path(str(file_path))
+			if not await async_file_path.exists():
 				return {'error': f'File not found: {file_path}'}
 
-			cookies = json.loads(file_path.read_text())
+			cookies = json.loads(await async_file_path.read_text())
 
-			# Get CDP session for bulk cookie setting
-			cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
-			if not cdp_session:
-				return {'error': 'No active browser session'}
+			if hasattr(bs, '_cdp_set_cookies'):
+				# Get CDP session for bulk cookie setting
+				cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
+				if not cdp_session:
+					return {'error': 'No active browser session'}
 
-			# Build cookie list for bulk set
-			cookie_list = []
-			for c in cookies:
-				cookie_params = {
-					'name': c['name'],
-					'value': c['value'],
-					'domain': c.get('domain'),
-					'path': c.get('path', '/'),
-					'secure': c.get('secure', False),
-					'httpOnly': c.get('httpOnly', False),
-				}
-				if c.get('sameSite'):
-					cookie_params['sameSite'] = c['sameSite']
-				if c.get('expires'):
-					cookie_params['expires'] = c['expires']
-				cookie_list.append(cookie_params)
+				# Build cookie list for bulk set
+				cookie_list = []
+				for c in cookies:
+					cookie_params = {
+						'name': c['name'],
+						'value': c['value'],
+						'domain': c.get('domain'),
+						'path': c.get('path', '/'),
+						'secure': c.get('secure', False),
+						'httpOnly': c.get('httpOnly', False),
+					}
+					if c.get('sameSite'):
+						cookie_params['sameSite'] = c['sameSite']
+					if c.get('expires'):
+						cookie_params['expires'] = c['expires']
+					cookie_list.append(cookie_params)
 
-			# Set all cookies in one call
-			try:
-				await cdp_session.cdp_client.send.Network.setCookies(
-					params={'cookies': cookie_list},  # type: ignore[arg-type]
-					session_id=cdp_session.session_id,
-				)
-				return {'imported': len(cookie_list), 'file': str(file_path)}
-			except Exception as e:
-				return {'error': f'Failed to import cookies: {e}'}
+				# Set all cookies in one call
+				try:
+					await cdp_session.cdp_client.send.Network.setCookies(
+						params={'cookies': cookie_list},  # type: ignore[arg-type]
+						session_id=cdp_session.session_id,
+					)
+					return {'imported': len(cookie_list), 'file': str(file_path)}
+				except Exception as e:
+					return {'error': f'Failed to import cookies: {e}'}
+
+			driver = getattr(bs, 'driver', None)
+			if driver is not None and hasattr(driver, 'set_cookie'):
+				imported = 0
+				for cookie in cookies:
+					try:
+						await driver.set_cookie(cookie)
+						imported += 1
+					except Exception:
+						continue
+				return {'imported': imported, 'file': str(file_path)}
+
+			return {'error': 'Cookie import is not supported for this browser backend'}
 
 		return {'error': 'Invalid cookies command. Use: get, set, clear, export, import'}
 
@@ -659,7 +815,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 					return {'index': index, 'value': ''}
 			except Exception as e:
 				logger.error(f'Failed to get element value: {e}')
-				return {'index': index, 'value': ''}
+				return {'index': index, 'value': node.attributes.get('value', '')}
 
 		elif get_command == 'attributes':
 			index = params['index']
@@ -697,6 +853,12 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 					return {'index': index, 'bbox': {}}
 			except Exception as e:
 				logger.error(f'Failed to get element bbox: {e}')
+				rect = node.absolute_position
+				if rect is not None:
+					return {
+						'index': index,
+						'bbox': {'x': rect.x, 'y': rect.y, 'width': rect.width, 'height': rect.height},
+					}
 				return {'index': index, 'bbox': {}}
 
 		return {'error': 'Invalid get command. Use: title, html, text, value, attributes, bbox'}
