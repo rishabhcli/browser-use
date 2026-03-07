@@ -73,6 +73,7 @@ class BaseWatchdog(BaseModel):
 		# Get the watchdog instance if this is a bound method
 		watchdog_instance = getattr(handler, '__self__', None)
 		watchdog_class_name = watchdog_instance.__class__.__name__ if watchdog_instance else 'Unknown'
+		requires_cdp_connection = not (browser_session.is_safari_backend and watchdog_class_name == 'SafariWatchdog')
 
 		# Events that should always run even when CDP is disconnected (lifecycle management)
 		LIFECYCLE_EVENT_NAMES = frozenset(
@@ -95,7 +96,11 @@ class BaseWatchdog(BaseModel):
 				# Circuit breaker: skip handler if CDP WebSocket is dead
 				# (prevents handlers from hanging on broken connections until timeout)
 				# Lifecycle events are exempt — they manage browser start/stop
-				if event.event_type not in LIFECYCLE_EVENT_NAMES and not browser_session.is_cdp_connected:
+				if (
+					event.event_type not in LIFECYCLE_EVENT_NAMES
+					and requires_cdp_connection
+					and not browser_session.is_cdp_connected
+				):
 					# If reconnection is in progress, wait for it instead of silently skipping
 					if browser_session.is_reconnecting:
 						wait_timeout = browser_session.RECONNECT_WAIT_TIMEOUT
@@ -175,31 +180,32 @@ class BaseWatchdog(BaseModel):
 					)
 
 					# attempt to repair potentially crashed CDP session
-					try:
-						if browser_session.agent_focus_target_id:
-							# With event-driven sessions, Chrome will send detach/attach events
-							# SessionManager handles pool cleanup automatically
-							target_id_to_restore = browser_session.agent_focus_target_id
-							browser_session.logger.debug(
-								f'🚌 {watchdog_and_handler_str} ⚠️ Session error detected, waiting for CDP events to sync (target: {target_id_to_restore})'
-							)
+					if requires_cdp_connection:
+						try:
+							if browser_session.agent_focus_target_id:
+								# With event-driven sessions, Chrome will send detach/attach events
+								# SessionManager handles pool cleanup automatically
+								target_id_to_restore = browser_session.agent_focus_target_id
+								browser_session.logger.debug(
+									f'🚌 {watchdog_and_handler_str} ⚠️ Session error detected, waiting for CDP events to sync (target: {target_id_to_restore})'
+								)
 
-							# Wait for new attach event to restore the session
-							# This will raise ValueError if target doesn't re-attach
-							await browser_session.get_or_create_cdp_session(target_id=target_id_to_restore, focus=True)
-						else:
-							# Try to get any available session
-							await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
-					except Exception as sub_error:
-						if 'ConnectionClosedError' in str(type(sub_error)) or 'ConnectionError' in str(type(sub_error)):
-							browser_session.logger.error(
-								f'🚌 {watchdog_and_handler_str} ❌ Browser closed or CDP Connection disconnected by remote. {type(sub_error).__name__}: {sub_error}\n'
-							)
-							raise
-						else:
-							browser_session.logger.error(
-								f'🚌 {watchdog_and_handler_str} ❌ CDP connected but failed to re-create CDP session after error "{type(original_error).__name__}: {original_error}" in {actual_handler.__name__}({event.event_type}#{event.event_id[-4:]}): due to {type(sub_error).__name__}: {sub_error}\n'
-							)
+								# Wait for new attach event to restore the session
+								# This will raise ValueError if target doesn't re-attach
+								await browser_session.get_or_create_cdp_session(target_id=target_id_to_restore, focus=True)
+							else:
+								# Try to get any available session
+								await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
+						except Exception as sub_error:
+							if 'ConnectionClosedError' in str(type(sub_error)) or 'ConnectionError' in str(type(sub_error)):
+								browser_session.logger.error(
+									f'🚌 {watchdog_and_handler_str} ❌ Browser closed or CDP Connection disconnected by remote. {type(sub_error).__name__}: {sub_error}\n'
+								)
+								raise
+							else:
+								browser_session.logger.error(
+									f'🚌 {watchdog_and_handler_str} ❌ CDP connected but failed to re-create CDP session after error "{type(original_error).__name__}: {original_error}" in {actual_handler.__name__}({event.event_type}#{event.event_id[-4:]}): due to {type(sub_error).__name__}: {sub_error}\n'
+								)
 
 					# Always re-raise the original error with its traceback preserved
 					raise

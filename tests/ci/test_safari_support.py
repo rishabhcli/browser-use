@@ -11,6 +11,7 @@ import pytest
 
 from browser_use.browser.backends.base import BackendCapabilityReport
 from browser_use.browser.backends.safari_backend import SafariRealProfileBackend, _run_jxa_sync
+from browser_use.browser.events import NavigateToUrlEvent
 from browser_use.browser.safari.capabilities import SafariCapabilityReport, probe_safari_environment
 from browser_use.browser.safari.profiles import SafariProfileStore
 from browser_use.browser.session import BrowserSession
@@ -136,7 +137,9 @@ async def test_safari_hover_element_uses_dom_mouse_events():
 
 	assert result == {'ok': True}
 	evaluate_javascript.assert_awaited_once()
-	script = evaluate_javascript.await_args.args[0]
+	await_args = evaluate_javascript.await_args
+	assert await_args is not None
+	script = await_args.args[0]
 	assert 'pointerover' in script
 	assert 'mousemove' in script
 	assert 'data-browser-use-safari-id="17"' in script
@@ -158,8 +161,31 @@ async def test_safari_double_click_element_uses_dom_double_click_events():
 
 	assert result == {'ok': True}
 	evaluate_javascript.assert_awaited_once()
-	script = evaluate_javascript.await_args.args[0]
+	await_args = evaluate_javascript.await_args
+	assert await_args is not None
+	script = await_args.args[0]
 	assert 'dblclick' in script
 	assert 'mousedown' in script
 	assert 'data-browser-use-safari-id="23"' in script
 	refresh_focus_target.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_safari_watchdog_dispatches_navigation_without_cdp():
+	"""Safari watchdog navigation should not be skipped just because there is no CDP socket."""
+	session = BrowserSession(automation_backend='safari', headless=False)
+	await session.attach_all_watchdogs()
+
+	assert isinstance(session._backend, SafariRealProfileBackend)
+	navigate_to = AsyncMock(return_value=None)
+	get_current_page_url = AsyncMock(return_value='https://www.amazon.com/')
+	object.__setattr__(session._backend, 'navigate_to', navigate_to)
+	object.__setattr__(session._backend, 'get_current_page_url', get_current_page_url)
+	session.agent_focus_target_id = 'safari:1:1'
+
+	event = session.event_bus.dispatch(NavigateToUrlEvent(url='https://www.amazon.com/'))
+	await event
+	await event.event_result(raise_if_any=True, raise_if_none=False)
+
+	navigate_to.assert_awaited_once_with('https://www.amazon.com/', new_tab=False)
+	get_current_page_url.assert_awaited_once()
