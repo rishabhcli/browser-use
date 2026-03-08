@@ -14,6 +14,58 @@ from browser_use.skill_cli import main as cli_main
 from browser_use.skill_cli.main import get_session_metadata_path
 
 
+def test_load_local_env_file_sets_missing_api_keys(tmp_path, monkeypatch):
+	"""Fast CLI should load local API keys from .env before launching the session server."""
+	env_path = tmp_path / '.env'
+	env_path.write_text('BROWSER_USE_API_KEY=test-browser-use-key\nOPENAI_API_KEY=test-openai-key\n')
+	monkeypatch.delenv('BROWSER_USE_API_KEY', raising=False)
+	monkeypatch.delenv('OPENAI_API_KEY', raising=False)
+
+	cli_main._load_local_env_file(env_path)
+
+	assert cli_main.os.environ['BROWSER_USE_API_KEY'] == 'test-browser-use-key'
+	assert cli_main.os.environ['OPENAI_API_KEY'] == 'test-openai-key'
+
+
+def test_load_local_env_file_does_not_override_existing_env(tmp_path, monkeypatch):
+	"""Explicit shell exports should win over values found in .env."""
+	env_path = tmp_path / '.env'
+	env_path.write_text('BROWSER_USE_API_KEY=from-dotenv\n')
+	monkeypatch.setenv('BROWSER_USE_API_KEY', 'from-shell')
+
+	cli_main._load_local_env_file(env_path)
+
+	assert cli_main.os.environ['BROWSER_USE_API_KEY'] == 'from-shell'
+
+
+def test_send_command_disables_socket_timeout_for_long_running_actions(monkeypatch):
+	"""Local run/python commands should wait for the server instead of timing out mid-task."""
+
+	class _FakeSocket:
+		def __init__(self):
+			self.timeout_values: list[float | None] = []
+
+		def settimeout(self, value):
+			self.timeout_values.append(value)
+
+		def sendall(self, data):
+			return None
+
+		def recv(self, size):
+			return b'{"id":"r1","success":true,"data":{"ok":true}}\n'
+
+		def close(self):
+			return None
+
+	fake_socket = _FakeSocket()
+	monkeypatch.setattr(cli_main, 'connect_to_server', lambda session: fake_socket)
+
+	response = cli_main.send_command('long-run', 'run', {'task': 'do work'})
+
+	assert response['success'] is True
+	assert fake_socket.timeout_values == [None]
+
+
 def test_get_session_metadata_path():
 	"""Test that metadata path is generated correctly."""
 	path = get_session_metadata_path('default')

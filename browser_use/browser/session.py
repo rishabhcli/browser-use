@@ -54,6 +54,7 @@ from browser_use.utils import _log_pretty_url, create_task_with_error_handling, 
 
 if TYPE_CHECKING:
 	from browser_use.actor.page import Page
+	from browser_use.browser.backends.safari_backend import SafariRealProfileBackend
 	from browser_use.browser.demo_mode import DemoMode
 	from browser_use.browser.watchdogs.captcha_watchdog import CaptchaWaitResult
 
@@ -476,6 +477,7 @@ class BrowserSession(BaseModel):
 				from browser_use.browser.backends.safari_backend import probe_local_safari_backend
 
 				report = probe_local_safari_backend(self.browser_profile.safari_profile or 'active')
+				self._backend_capabilities = report
 
 			details = report.details if report else {}
 			issues = [report.reason] if report and report.reason else []
@@ -492,6 +494,7 @@ class BrowserSession(BaseModel):
 				supports_downloads=True,
 				supports_uploads=True,
 				supports_cookie_access=False,
+				supports_cdp=False,
 				accessibility_permission='granted'
 				if details.get('gui_scripting_available') is True
 				else 'missing'
@@ -518,6 +521,7 @@ class BrowserSession(BaseModel):
 			supports_downloads=True,
 			supports_uploads=True,
 			supports_cookie_access=True,
+			supports_cdp=True,
 		)
 
 	@property
@@ -534,6 +538,11 @@ class BrowserSession(BaseModel):
 	def is_safari_backend(self) -> bool:
 		"""Whether this session uses the Safari real-profile backend."""
 		return self.automation_backend == 'safari'
+
+	def _require_safari_backend(self) -> 'SafariRealProfileBackend':
+		"""Return the active Safari backend with a narrowed type."""
+		assert self._backend is not None
+		return cast('SafariRealProfileBackend', self._backend)
 
 	@property
 	def backend_capabilities(self) -> Any:
@@ -2492,6 +2501,72 @@ class BrowserSession(BaseModel):
 		await event
 		await event.event_result(raise_if_any=True, raise_if_none=False)
 
+	async def go_back(self) -> None:
+		"""Navigate back via the shared event contract."""
+		from browser_use.browser.events import GoBackEvent
+
+		event = self.event_bus.dispatch(GoBackEvent())
+		await event
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+
+	async def go_forward(self) -> None:
+		"""Navigate forward via the shared event contract."""
+		from browser_use.browser.events import GoForwardEvent
+
+		event = self.event_bus.dispatch(GoForwardEvent())
+		await event
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+
+	async def scroll_to_text(self, text: str, direction: Literal['up', 'down'] = 'down') -> None:
+		"""Scroll until text is visible via the shared event contract."""
+		from browser_use.browser.events import ScrollToTextEvent
+
+		event = self.event_bus.dispatch(ScrollToTextEvent(text=text, direction=direction))
+		await event
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+
+	async def get_dropdown_options(self, node: EnhancedDOMTreeNode) -> dict[str, str]:
+		"""Return dropdown options for an element via the shared event contract."""
+		from browser_use.browser.events import GetDropdownOptionsEvent
+
+		event = self.event_bus.dispatch(GetDropdownOptionsEvent(node=node))
+		result = await event.event_result(raise_if_any=True, raise_if_none=True)
+		if not isinstance(result, dict):
+			return {}
+		if 'options' in result:
+			import json
+
+			raw_options = result.get('options')
+			options = json.loads(raw_options) if isinstance(raw_options, str) else raw_options
+			if isinstance(options, list):
+				return {
+					str(option.get('text', '')): str(option.get('value', ''))
+					for option in options
+					if isinstance(option, dict) and option.get('text') is not None
+				}
+		return cast(dict[str, str], result)
+
+	async def select_dropdown_option(self, node: EnhancedDOMTreeNode, text: str) -> dict[str, Any]:
+		"""Select a dropdown option via the shared event contract."""
+		from browser_use.browser.events import SelectDropdownOptionEvent
+
+		event = self.event_bus.dispatch(SelectDropdownOptionEvent(node=node, text=text))
+		result = await event.event_result(raise_if_any=True, raise_if_none=True)
+		if isinstance(result, dict) and result.get('success') == 'true':
+			return {
+				'text': text,
+				'value': result.get('value', text),
+			}
+		return cast(dict[str, Any], result)
+
+	async def upload_file_to_element(self, node: EnhancedDOMTreeNode, file_path: str) -> None:
+		"""Upload a file to an element via the shared event contract."""
+		from browser_use.browser.events import UploadFileEvent
+
+		event = self.event_bus.dispatch(UploadFileEvent(node=node, file_path=file_path))
+		await event
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+
 	async def _enhanced_css_selector_for_element(self, element: Any) -> str | None:
 		"""Backward-compatible helper to generate a CSS selector for an element-like object.
 
@@ -2681,6 +2756,267 @@ class BrowserSession(BaseModel):
 	async def get_element_by_index(self, index: int) -> EnhancedDOMTreeNode | None:
 		"""Alias for get_dom_element_by_index for backwards compatibility."""
 		return await self.get_dom_element_by_index(index)
+
+	async def get_element_bounding_box(self, node: EnhancedDOMTreeNode) -> dict[str, float]:
+		"""Get the current bounding box for an element.
+
+		Returns page-relative coordinates for parity with CLI and tooling helpers.
+		"""
+		if self.is_safari_backend:
+			absolute_position = node.absolute_position
+			if absolute_position is not None:
+				return {
+					'x': absolute_position.x,
+					'y': absolute_position.y,
+					'width': absolute_position.width,
+					'height': absolute_position.height,
+				}
+
+			result = await self.evaluate_javascript(
+				f"""
+				(() => {{
+					const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
+					if (!el) return null;
+					const rect = el.getBoundingClientRect();
+					return {{
+						x: rect.left + window.scrollX,
+						y: rect.top + window.scrollY,
+						width: rect.width,
+						height: rect.height,
+					}};
+				}})()
+				"""
+			)
+			return result if isinstance(result, dict) else {}
+
+		cdp_session = await self.cdp_client_for_node(node)
+		box_result = await cdp_session.cdp_client.send.DOM.getBoxModel(
+			params={'backendNodeId': node.backend_node_id},
+			session_id=cdp_session.session_id,
+		)
+
+		model = box_result['model']  # type: ignore[index]
+		content = model.get('content', [])  # type: ignore[union-attr]
+		if len(content) < 8:
+			return {}
+
+		x = min(content[0], content[2], content[4], content[6])
+		y = min(content[1], content[3], content[5], content[7])
+		width = max(content[0], content[2], content[4], content[6]) - x
+		height = max(content[1], content[3], content[5], content[7]) - y
+		return {'x': x, 'y': y, 'width': width, 'height': height}
+
+	async def get_element_center(self, node: EnhancedDOMTreeNode) -> tuple[float, float] | None:
+		"""Get the current center point for an element."""
+		bbox = await self.get_element_bounding_box(node)
+		if not bbox:
+			return None
+
+		try:
+			return bbox['x'] + bbox['width'] / 2, bbox['y'] + bbox['height'] / 2
+		except KeyError:
+			return None
+
+	async def get_element_value(self, node: EnhancedDOMTreeNode) -> Any:
+		"""Read the current value for an element."""
+		if self.is_safari_backend:
+			return await self.evaluate_javascript(
+				f"""
+				(() => {{
+					const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
+					if (!el) return null;
+					if ('value' in el) return el.value;
+					if (el.isContentEditable) return el.textContent || '';
+					return el.getAttribute('value') || '';
+				}})()
+				"""
+			)
+
+		cdp_session = await self.cdp_client_for_node(node)
+		resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
+			params={'backendNodeId': node.backend_node_id},
+			session_id=cdp_session.session_id,
+		)
+		object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
+		if not object_id:
+			return ''
+
+		value_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+			params={
+				'objectId': object_id,
+				'functionDeclaration': 'function() { return this.value; }',
+				'returnByValue': True,
+			},
+			session_id=cdp_session.session_id,
+		)
+		return value_result.get('result', {}).get('value')
+
+	async def get_element_text(self, node: EnhancedDOMTreeNode) -> str:
+		"""Read the current rendered text for an element."""
+		snapshot_text = node.get_all_children_text(max_depth=10)
+		if self.is_safari_backend:
+			result = await self.evaluate_javascript(
+				f"""
+				(() => {{
+					const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
+					if (!el) return null;
+					return el.innerText || el.textContent || '';
+				}})()
+				"""
+			)
+			return result if isinstance(result, str) else snapshot_text
+
+		cdp_session = await self.cdp_client_for_node(node)
+		resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
+			params={'backendNodeId': node.backend_node_id},
+			session_id=cdp_session.session_id,
+		)
+		object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
+		if not object_id:
+			return snapshot_text
+
+		text_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+			params={
+				'objectId': object_id,
+				'functionDeclaration': 'function() { return this.innerText || this.textContent || ""; }',
+				'returnByValue': True,
+			},
+			session_id=cdp_session.session_id,
+		)
+		value = text_result.get('result', {}).get('value')
+		return value if isinstance(value, str) else snapshot_text
+
+	async def get_element_attributes(self, node: EnhancedDOMTreeNode) -> dict[str, Any]:
+		"""Read the current attributes for an element."""
+		snapshot_attrs = dict(node.attributes or {})
+		if self.is_safari_backend:
+			result = await self.evaluate_javascript(
+				f"""
+				(() => {{
+					const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
+					if (!el) return null;
+					return Object.fromEntries(Array.from(el.attributes).map(attr => [attr.name, attr.value]));
+				}})()
+				"""
+			)
+			return result if isinstance(result, dict) else snapshot_attrs
+
+		cdp_session = await self.cdp_client_for_node(node)
+		resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
+			params={'backendNodeId': node.backend_node_id},
+			session_id=cdp_session.session_id,
+		)
+		object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
+		if not object_id:
+			return snapshot_attrs
+
+		attrs_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+			params={
+				'objectId': object_id,
+				'functionDeclaration': 'function() { return Object.fromEntries(Array.from(this.attributes || []).map(attr => [attr.name, attr.value])); }',
+				'returnByValue': True,
+			},
+			session_id=cdp_session.session_id,
+		)
+		value = attrs_result.get('result', {}).get('value')
+		return value if isinstance(value, dict) else snapshot_attrs
+
+	async def hover_element(self, node: EnhancedDOMTreeNode) -> dict[str, Any] | None:
+		"""Hover an element using the active backend."""
+		if self.is_safari_backend:
+			return await self._require_safari_backend().hover_element(node)
+
+		coords = await self.get_element_center(node)
+		if not coords:
+			return None
+
+		center_x, center_y = coords
+		cdp_session = await self.cdp_client_for_node(node)
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+			session_id=cdp_session.session_id,
+		)
+		return {'hovered': node.backend_node_id}
+
+	async def double_click_element(self, node: EnhancedDOMTreeNode) -> dict[str, Any] | None:
+		"""Double-click an element using the active backend."""
+		if self.is_safari_backend:
+			return await self._require_safari_backend().double_click_element(node)
+
+		coords = await self.get_element_center(node)
+		if not coords:
+			return None
+
+		center_x, center_y = coords
+		cdp_session = await self.cdp_client_for_node(node)
+		session_id = cdp_session.session_id
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+			session_id=session_id,
+		)
+		await asyncio.sleep(0.05)
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={
+				'type': 'mousePressed',
+				'x': center_x,
+				'y': center_y,
+				'button': 'left',
+				'clickCount': 2,
+			},
+			session_id=session_id,
+		)
+		await asyncio.sleep(0.05)
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={
+				'type': 'mouseReleased',
+				'x': center_x,
+				'y': center_y,
+				'button': 'left',
+				'clickCount': 2,
+			},
+			session_id=session_id,
+		)
+		return {'double_clicked': node.backend_node_id}
+
+	async def right_click_element(self, node: EnhancedDOMTreeNode) -> dict[str, Any] | None:
+		"""Right-click an element using the active backend."""
+		if self.is_safari_backend:
+			return await self._require_safari_backend().click_element(node, button='right')
+
+		coords = await self.get_element_center(node)
+		if not coords:
+			return None
+
+		center_x, center_y = coords
+		cdp_session = await self.cdp_client_for_node(node)
+		session_id = cdp_session.session_id
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
+			session_id=session_id,
+		)
+		await asyncio.sleep(0.05)
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={
+				'type': 'mousePressed',
+				'x': center_x,
+				'y': center_y,
+				'button': 'right',
+				'clickCount': 1,
+			},
+			session_id=session_id,
+		)
+		await asyncio.sleep(0.05)
+		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+			params={
+				'type': 'mouseReleased',
+				'x': center_x,
+				'y': center_y,
+				'button': 'right',
+				'clickCount': 1,
+			},
+			session_id=session_id,
+		)
+		return {'right_clicked': node.backend_node_id}
 
 	async def get_dom_element_at_coordinates(self, x: int, y: int) -> EnhancedDOMTreeNode | None:
 		"""Get DOM element at coordinates as EnhancedDOMTreeNode.

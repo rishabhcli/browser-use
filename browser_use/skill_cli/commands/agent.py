@@ -9,6 +9,13 @@ from browser_use.skill_cli.sessions import SessionInfo
 
 logger = logging.getLogger(__name__)
 
+LLM_ENV_KEYS = (
+	'BROWSER_USE_API_KEY',
+	'OPENAI_API_KEY',
+	'ANTHROPIC_API_KEY',
+	'GOOGLE_API_KEY',
+)
+
 # Cloud-only flags that only work in remote mode
 CLOUD_ONLY_FLAGS = [
 	'session_id',
@@ -193,6 +200,13 @@ async def _handle_local_task(session: SessionInfo, params: dict[str, Any]) -> An
 	task = params['task']
 	max_steps = params.get('max_steps')
 	model = params.get('llm')  # Optional model override
+	env_overrides = params.get('_env_overrides')
+
+	if isinstance(env_overrides, dict):
+		for key in LLM_ENV_KEYS:
+			value = env_overrides.get(key)
+			if isinstance(value, str) and value:
+				os.environ[key] = value
 
 	try:
 		# Import agent and LLM

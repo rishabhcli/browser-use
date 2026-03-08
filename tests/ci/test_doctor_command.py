@@ -52,6 +52,7 @@ def test_check_safari_backend_available():
 
 	assert result['status'] == 'ok'
 	assert 'available' in result['message'].lower()
+	assert '--browser safari' in result['note']
 
 
 def test_check_safari_backend_with_limitations():
@@ -68,6 +69,7 @@ def test_check_safari_backend_with_limitations():
 
 	assert result['status'] == 'warning'
 	assert 'limitations' in result['message'].lower()
+	assert '--browser safari' in result['note']
 
 
 def test_check_safari_backend_unavailable():
@@ -83,6 +85,7 @@ def test_check_safari_backend_unavailable():
 
 	assert result['status'] == 'warning'
 	assert 'required' in result['message'].lower()
+	assert '--browser safari' in result['note']
 
 
 def test_check_api_key_with_env_var(monkeypatch):

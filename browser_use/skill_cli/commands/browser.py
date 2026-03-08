@@ -36,11 +36,6 @@ COMMANDS = {
 }
 
 
-def _is_safari_backend(browser_session: Any) -> bool:
-	"""Whether the current browser session uses the Safari backend."""
-	return bool(getattr(browser_session, 'is_safari_backend', False))
-
-
 async def _dispatch_event_and_require_success(event: Any) -> Any:
 	"""Await a Bubus event and surface handler failures to the CLI."""
 	await cast(Awaitable[Any], event)
@@ -65,38 +60,6 @@ async def _execute_js(session: SessionInfo, js: str) -> Any:
 		session_id=cdp_session.session_id,
 	)
 	return result.get('result', {}).get('value')
-
-
-async def _get_element_center(session: SessionInfo, node: Any) -> tuple[float, float] | None:
-	"""Get the center coordinates of an element."""
-	bs = session.browser_session
-	absolute_position = getattr(node, 'absolute_position', None)
-	if absolute_position is not None:
-		return absolute_position.x + absolute_position.width / 2, absolute_position.y + absolute_position.height / 2
-	try:
-		cdp_session = await bs.cdp_client_for_node(node)
-		session_id = cdp_session.session_id
-		backend_node_id = node.backend_node_id
-
-		# Scroll element into view first
-		try:
-			await cdp_session.cdp_client.send.DOM.scrollIntoViewIfNeeded(
-				params={'backendNodeId': backend_node_id}, session_id=session_id
-			)
-			await asyncio.sleep(0.05)
-		except Exception:
-			pass
-
-		# Get element coordinates
-		element_rect = await bs.get_element_coordinates(backend_node_id, cdp_session)
-		if element_rect:
-			center_x = element_rect.x + element_rect.width / 2
-			center_y = element_rect.y + element_rect.height / 2
-			return center_x, center_y
-		return None
-	except Exception as e:
-		logger.error(f'Failed to get element center: {e}')
-		return None
 
 
 async def _extract_page_data(
@@ -146,166 +109,6 @@ async def _extract_page_data(
 	return result.long_term_memory
 
 
-async def _get_element_value(session: SessionInfo, node: Any) -> Any:
-	"""Read the current value/text content for an indexed element."""
-	bs = session.browser_session
-	if _is_safari_backend(bs):
-		return await bs.evaluate_javascript(
-			f"""
-			(() => {{
-				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
-				if (!el) return null;
-				if ('value' in el) return el.value;
-				if (el.isContentEditable) return el.textContent || '';
-				return el.getAttribute('value') || '';
-			}})()
-			"""
-		)
-
-	cdp_session = await bs.cdp_client_for_node(node)
-	resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
-		params={'backendNodeId': node.backend_node_id},
-		session_id=cdp_session.session_id,
-	)
-	object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
-
-	if not object_id:
-		return ''
-
-	value_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
-		params={
-			'objectId': object_id,
-			'functionDeclaration': 'function() { return this.value; }',
-			'returnByValue': True,
-		},
-		session_id=cdp_session.session_id,
-	)
-	return value_result.get('result', {}).get('value')
-
-
-async def _get_element_bbox(session: SessionInfo, node: Any) -> dict[str, float]:
-	"""Read the current bounding box for an indexed element."""
-	bs = session.browser_session
-	if _is_safari_backend(bs):
-		absolute_position = getattr(node, 'absolute_position', None)
-		if absolute_position is not None:
-			return {
-				'x': absolute_position.x,
-				'y': absolute_position.y,
-				'width': absolute_position.width,
-				'height': absolute_position.height,
-			}
-
-		result = await bs.evaluate_javascript(
-			f"""
-			(() => {{
-				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
-				if (!el) return null;
-				const rect = el.getBoundingClientRect();
-				return {{
-					x: rect.left + window.scrollX,
-					y: rect.top + window.scrollY,
-					width: rect.width,
-					height: rect.height,
-				}};
-			}})()
-			"""
-		)
-		return result if isinstance(result, dict) else {}
-
-	cdp_session = await bs.cdp_client_for_node(node)
-	box_result = await cdp_session.cdp_client.send.DOM.getBoxModel(
-		params={'backendNodeId': node.backend_node_id},
-		session_id=cdp_session.session_id,
-	)
-
-	model = box_result['model']  # type: ignore[index]
-	content = model.get('content', [])  # type: ignore[union-attr]
-
-	if len(content) < 8:
-		return {}
-
-	x = min(content[0], content[2], content[4], content[6])
-	y = min(content[1], content[3], content[5], content[7])
-	width = max(content[0], content[2], content[4], content[6]) - x
-	height = max(content[1], content[3], content[5], content[7]) - y
-	return {'x': x, 'y': y, 'width': width, 'height': height}
-
-
-async def _get_element_text(session: SessionInfo, node: Any) -> str:
-	"""Read the current rendered text for an indexed element."""
-	bs = session.browser_session
-	snapshot_text = node.get_all_children_text(max_depth=10) if node else ''
-	if _is_safari_backend(bs):
-		result = await bs.evaluate_javascript(
-			f"""
-			(() => {{
-				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
-				if (!el) return null;
-				return el.innerText || el.textContent || '';
-			}})()
-			"""
-		)
-		return result if isinstance(result, str) else snapshot_text
-
-	cdp_session = await bs.cdp_client_for_node(node)
-	resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
-		params={'backendNodeId': node.backend_node_id},
-		session_id=cdp_session.session_id,
-	)
-	object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
-	if not object_id:
-		return snapshot_text
-
-	text_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
-		params={
-			'objectId': object_id,
-			'functionDeclaration': 'function() { return this.innerText || this.textContent || ""; }',
-			'returnByValue': True,
-		},
-		session_id=cdp_session.session_id,
-	)
-	value = text_result.get('result', {}).get('value')
-	return value if isinstance(value, str) else snapshot_text
-
-
-async def _get_element_attributes(session: SessionInfo, node: Any) -> dict[str, Any]:
-	"""Read the current attributes for an indexed element."""
-	bs = session.browser_session
-	snapshot_attrs = dict(node.attributes or {})
-	if _is_safari_backend(bs):
-		result = await bs.evaluate_javascript(
-			f"""
-			(() => {{
-				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
-				if (!el) return null;
-				return Object.fromEntries(Array.from(el.attributes).map(attr => [attr.name, attr.value]));
-			}})()
-			"""
-		)
-		return result if isinstance(result, dict) else snapshot_attrs
-
-	cdp_session = await bs.cdp_client_for_node(node)
-	resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
-		params={'backendNodeId': node.backend_node_id},
-		session_id=cdp_session.session_id,
-	)
-	object_id = resolve_result['object'].get('objectId')  # type: ignore[union-attr]
-	if not object_id:
-		return snapshot_attrs
-
-	attrs_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
-		params={
-			'objectId': object_id,
-			'functionDeclaration': 'function() { return Object.fromEntries(Array.from(this.attributes || []).map(attr => [attr.name, attr.value])); }',
-			'returnByValue': True,
-		},
-		session_id=cdp_session.session_id,
-	)
-	value = attrs_result.get('result', {}).get('value')
-	return value if isinstance(value, dict) else snapshot_attrs
-
-
 async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> Any:
 	"""Handle browser control command."""
 	bs = session.browser_session
@@ -351,7 +154,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 	elif action == 'type':
 		text = params['text']
-		if _is_safari_backend(bs):
+		if bs.is_safari_backend:
 			from browser_use.browser.events import SendKeysEvent
 
 			await _dispatch_event_and_require_success(bs.event_bus.dispatch(SendKeysEvent(keys=text)))
@@ -490,26 +293,11 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		node = await bs.get_element_by_index(index)
 		if node is None:
 			return {'error': f'Element index {index} not found - page may have changed'}
-
-		if _is_safari_backend(bs):
-			backend = getattr(bs, '_backend', None)
-			if backend is None or not hasattr(backend, 'hover_element'):
-				return {'error': 'Safari backend is not ready for hover yet'}
-			result = await backend.hover_element(node)
-			if isinstance(result, dict) and result.get('ok') is False:
-				return {'error': f'Safari hover failed: {result.get("error", "unknown_error")}'}
-			return {'hovered': index}
-
-		coords = await _get_element_center(session, node)
-		if not coords:
+		hover_result = await bs.hover_element(node)
+		if hover_result is None:
 			return {'error': 'Could not get element coordinates for hover'}
-
-		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=cdp_session.session_id,
-		)
+		if hover_result.get('ok') is False:
+			return {'error': f'Hover failed: {hover_result.get("error", "unknown_error")}'}
 		return {'hovered': index}
 
 	elif action == 'dblclick':
@@ -517,54 +305,11 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		node = await bs.get_element_by_index(index)
 		if node is None:
 			return {'error': f'Element index {index} not found - page may have changed'}
-
-		if _is_safari_backend(bs):
-			backend = getattr(bs, '_backend', None)
-			if backend is None or not hasattr(backend, 'double_click_element'):
-				return {'error': 'Safari backend is not ready for double-click yet'}
-			result = await backend.double_click_element(node)
-			if isinstance(result, dict) and result.get('ok') is False:
-				return {'error': f'Safari double-click failed: {result.get("error", "unknown_error")}'}
-			return {'double_clicked': index}
-
-		coords = await _get_element_center(session, node)
-		if not coords:
+		double_click_result = await bs.double_click_element(node)
+		if double_click_result is None:
 			return {'error': 'Could not get element coordinates for double-click'}
-
-		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		session_id = cdp_session.session_id
-
-		# Move mouse to element
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
-
-		# Double click (clickCount: 2)
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mousePressed',
-				'x': center_x,
-				'y': center_y,
-				'button': 'left',
-				'clickCount': 2,
-			},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
-
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mouseReleased',
-				'x': center_x,
-				'y': center_y,
-				'button': 'left',
-				'clickCount': 2,
-			},
-			session_id=session_id,
-		)
+		if double_click_result.get('ok') is False:
+			return {'error': f'Double-click failed: {double_click_result.get("error", "unknown_error")}'}
 		return {'double_clicked': index}
 
 	elif action == 'rightclick':
@@ -572,59 +317,17 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		node = await bs.get_element_by_index(index)
 		if node is None:
 			return {'error': f'Element index {index} not found - page may have changed'}
-
-		if _is_safari_backend(bs):
-			backend = getattr(bs, '_backend', None)
-			if backend is None or not hasattr(backend, 'click_element'):
-				return {'error': 'Safari backend is not ready for right-click yet'}
-			result = await backend.click_element(node, button='right')
-			if isinstance(result, dict) and result.get('ok') is False:
-				return {'error': f'Safari right-click failed: {result.get("error", "unknown_error")}'}
-			return {'right_clicked': index}
-
-		coords = await _get_element_center(session, node)
-		if not coords:
+		right_click_result = await bs.right_click_element(node)
+		if right_click_result is None:
 			return {'error': 'Could not get element coordinates for right-click'}
-
-		center_x, center_y = coords
-		cdp_session = await bs.cdp_client_for_node(node)
-		session_id = cdp_session.session_id
-
-		# Move mouse to element
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
-
-		# Right click (button: 'right')
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mousePressed',
-				'x': center_x,
-				'y': center_y,
-				'button': 'right',
-				'clickCount': 1,
-			},
-			session_id=session_id,
-		)
-		await asyncio.sleep(0.05)
-
-		await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
-			params={
-				'type': 'mouseReleased',
-				'x': center_x,
-				'y': center_y,
-				'button': 'right',
-				'clickCount': 1,
-			},
-			session_id=session_id,
-		)
+		if right_click_result.get('ok') is False:
+			return {'error': f'Right-click failed: {right_click_result.get("error", "unknown_error")}'}
 		return {'right_clicked': index}
 
 	elif action == 'cookies':
-		if _is_safari_backend(bs):
-			return {'error': 'Safari backend does not expose cookies through the CLI'}
+		capabilities = bs.get_backend_capabilities()
+		if not capabilities.supports_cookie_access:
+			return {'error': f'Cookie operations are not available for the {capabilities.browser_name} backend'}
 
 		cookies_command = params.get('cookies_command')
 
@@ -916,7 +619,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			if node is None:
 				return {'error': f'Element index {index} not found - page may have changed'}
 			try:
-				text = await _get_element_text(session, node)
+				text = await bs.get_element_text(node)
 				return {'index': index, 'text': text}
 			except Exception as e:
 				logger.error(f'Failed to get element text: {e}')
@@ -929,7 +632,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				return {'error': f'Element index {index} not found - page may have changed'}
 
 			try:
-				value = await _get_element_value(session, node)
+				value = await bs.get_element_value(node)
 				return {'index': index, 'value': value or ''}
 			except Exception as e:
 				logger.error(f'Failed to get element value: {e}')
@@ -941,7 +644,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			if node is None:
 				return {'error': f'Element index {index} not found - page may have changed'}
 			try:
-				attrs = await _get_element_attributes(session, node)
+				attrs = await bs.get_element_attributes(node)
 				return {'index': index, 'attributes': attrs}
 			except Exception as e:
 				logger.error(f'Failed to get element attributes: {e}')
@@ -954,7 +657,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				return {'error': f'Element index {index} not found - page may have changed'}
 
 			try:
-				bbox = await _get_element_bbox(session, node)
+				bbox = await bs.get_element_bounding_box(node)
 				return {'index': index, 'bbox': bbox}
 			except Exception as e:
 				logger.error(f'Failed to get element bbox: {e}')

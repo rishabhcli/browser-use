@@ -18,7 +18,6 @@ from browser_use.browser.events import (
 	ClickCoordinateEvent,
 	ClickElementEvent,
 	CloseTabEvent,
-	GetDropdownOptionsEvent,
 	GoBackEvent,
 	NavigateToUrlEvent,
 	ScrollEvent,
@@ -457,6 +456,7 @@ class Tools(Generic[Context]):
 			try:
 				event = browser_session.event_bus.dispatch(GoBackEvent())
 				await event
+				await event.event_result(raise_if_any=True, raise_if_none=False)
 				memory = 'Navigated back'
 				msg = f'🔙  {memory}'
 				logger.info(msg)
@@ -1523,18 +1523,24 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				logger.warning(f'⚠️ {msg}')
 				return ActionResult(extracted_content=msg)
 
-			# Dispatch GetDropdownOptionsEvent to the event handler
+			options_by_text = await browser_session.get_dropdown_options(node)
+			if not options_by_text:
+				msg = f'No dropdown options found for element at index {params.index}'
+				return ActionResult(
+					extracted_content=msg,
+					long_term_memory=msg,
+					include_extracted_content_only_once=True,
+				)
 
-			event = browser_session.event_bus.dispatch(GetDropdownOptionsEvent(node=node))
-			dropdown_data = await event.event_result(timeout=3.0, raise_if_none=True, raise_if_any=True)
-
-			if not dropdown_data:
-				raise ValueError('Failed to get dropdown options - no data returned')
-
-			# Use structured memory from the handler
+			formatted_options = [
+				f'{position}: text={json.dumps(text)}, value={json.dumps(value)}'
+				for position, (text, value) in enumerate(options_by_text.items())
+			]
+			msg = 'Found dropdown options:\n' + '\n'.join(formatted_options)
+			msg += f'\n\nUse the exact text or value string (without quotes) in select_dropdown(index={params.index}, text=...)'
 			return ActionResult(
-				extracted_content=dropdown_data['short_term_memory'],
-				long_term_memory=dropdown_data['long_term_memory'],
+				extracted_content=msg,
+				long_term_memory=f'Got dropdown options for element at index {params.index}',
 				include_extracted_content_only_once=True,
 			)
 
@@ -1551,37 +1557,28 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				logger.warning(f'⚠️ {msg}')
 				return ActionResult(extracted_content=msg)
 
-			# Dispatch SelectDropdownOptionEvent to the event handler
-			from browser_use.browser.events import SelectDropdownOptionEvent
-
-			event = browser_session.event_bus.dispatch(SelectDropdownOptionEvent(node=node, text=params.text))
-			selection_data = await event.event_result()
-
+			selection_data = await browser_session.select_dropdown_option(node, params.text)
 			if not selection_data:
 				raise ValueError('Failed to select dropdown option - no data returned')
 
-			# Check if the selection was successful
-			if selection_data.get('success') == 'true':
-				# Extract the message from the returned data
-				msg = selection_data.get('message', f'Selected option: {params.text}')
+			if 'short_term_memory' in selection_data and 'long_term_memory' in selection_data:
 				return ActionResult(
-					extracted_content=msg,
-					include_in_memory=True,
-					long_term_memory=f"Selected dropdown option '{params.text}' at index {params.index}",
+					extracted_content=selection_data['short_term_memory'],
+					long_term_memory=selection_data['long_term_memory'],
+					include_extracted_content_only_once=True,
 				)
-			else:
-				# Handle structured error response
-				# TODO: raise BrowserError instead of returning ActionResult
-				if 'short_term_memory' in selection_data and 'long_term_memory' in selection_data:
-					return ActionResult(
-						extracted_content=selection_data['short_term_memory'],
-						long_term_memory=selection_data['long_term_memory'],
-						include_extracted_content_only_once=True,
-					)
-				else:
-					# Fallback to regular error
-					error_msg = selection_data.get('error', f'Failed to select option: {params.text}')
-					return ActionResult(error=error_msg)
+
+			if selection_data.get('error'):
+				return ActionResult(error=selection_data['error'])
+
+			selected_text = selection_data.get('text', params.text)
+			selected_value = selection_data.get('value', selected_text)
+			msg = f'Selected option: text={json.dumps(str(selected_text))}, value={json.dumps(str(selected_value))}'
+			return ActionResult(
+				extracted_content=msg,
+				include_in_memory=True,
+				long_term_memory=f"Selected dropdown option '{params.text}' at index {params.index}",
+			)
 
 		# File System Actions
 

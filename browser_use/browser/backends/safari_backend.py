@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
 import os
 import subprocess
 import tempfile
@@ -42,6 +43,38 @@ def _run_jxa_sync(script: str, timeout: float = 15) -> str:
 	try:
 		result = subprocess.run(
 			['osascript', '-l', 'JavaScript'],
+			input=script,
+			capture_output=True,
+			text=True,
+			check=True,
+			timeout=timeout,
+		)
+		return result.stdout.strip()
+	except subprocess.TimeoutExpired as exc:
+		raise BrowserError(
+			'Safari automation command timed out.',
+			details={
+				'timeout_seconds': timeout,
+				'stderr': _safe_process_output(exc.stderr),
+				'stdout': _safe_process_output(exc.stdout),
+			},
+		) from exc
+	except subprocess.CalledProcessError as exc:
+		raise BrowserError(
+			'Safari automation command failed.',
+			details={'stderr': _safe_process_output(exc.stderr), 'stdout': _safe_process_output(exc.stdout)},
+		) from exc
+	except OSError as exc:
+		raise BrowserError(
+			'Safari automation command could not be launched.',
+			details={'error': str(exc)},
+		) from exc
+
+
+def _run_applescript_sync(script: str, timeout: float = 15) -> str:
+	try:
+		result = subprocess.run(
+			['osascript'],
 			input=script,
 			capture_output=True,
 			text=True,
@@ -195,15 +228,21 @@ class SafariRealProfileBackend(BrowserBackend):
 			safari.activate();
 			const windowId = {window['windowId']};
 			const win = safari.windows().find(w => w.id() === windowId) || safari.windows()[0];
-			const currentIndex = win.currentTab().index();
-			const tabs = win.tabs().map(tab => ({{
-				windowId: win.id(),
-				tabIndex: tab.index(),
-				url: tab.url() || "about:blank",
-				title: tab.name() || "",
-				isCurrent: tab.index() === currentIndex,
-			}}));
-			JSON.stringify(tabs);
+			if (!win) {{
+				JSON.stringify([]);
+			}} else {{
+				const tabs = Array.from(win.tabs()).filter(Boolean);
+				const currentTab = win.currentTab();
+				const fallbackTab = tabs[0] || null;
+				const currentIndex = currentTab ? currentTab.index() : (fallbackTab ? fallbackTab.index() : null);
+				JSON.stringify(tabs.map(tab => ({{
+					windowId: win.id(),
+					tabIndex: tab.index(),
+					url: tab.url() || "about:blank",
+					title: tab.name() || "",
+					isCurrent: currentIndex !== null && tab.index() === currentIndex,
+				}})));
+			}}
 			"""
 		)
 		tabs: list[TabInfo] = []
@@ -223,45 +262,79 @@ class SafariRealProfileBackend(BrowserBackend):
 
 	async def get_current_page_url(self) -> str:
 		window = await self._ensure_profile_window()
+		try:
+			js_url = await self.evaluate_javascript('location.href')
+			if isinstance(js_url, str) and js_url:
+				return js_url
+		except Exception:
+			pass
 		return str(window.get('url') or 'about:blank')
 
 	async def get_current_page_title(self) -> str:
 		window = await self._ensure_profile_window()
-		return str(window.get('title') or '')
+		title = str(window.get('title') or '')
+		deadline = asyncio.get_running_loop().time() + 3.0
+		while True:
+			try:
+				js_title = await self.evaluate_javascript('document.title')
+			except Exception:
+				js_title = None
+			if isinstance(js_title, str) and js_title.strip():
+				return js_title.strip()
+			if title and title != 'Untitled':
+				return title
+			if asyncio.get_running_loop().time() >= deadline:
+				break
+			await asyncio.sleep(0.15)
+			window = await self._ensure_profile_window()
+			title = str(window.get('title') or '')
+		return title or 'Unknown page title'
 
 	async def navigate_to(self, url: str, new_tab: bool = False) -> None:
-		await self._ensure_profile_window()
+		window = await self._ensure_profile_window()
+		window_id = int(window['windowId'])
 		await self._run_jxa(
 			f"""
 			const safari = Application("Safari");
 			safari.activate();
 			const url = {json.dumps(url)};
-			if (safari.windows.length === 0) {{
-				safari.Document().make();
+			if (safari.windows().length === 0) {{
+				throw new Error("Safari has no open windows.");
 			}}
-			const win = safari.windows()[0];
+			const win = safari.windows().find(w => w.id() === {window_id}) || safari.windows()[0];
 			if ({'true' if new_tab else 'false'}) {{
-				safari.Tab({{url}}).make();
-				const tabs = win.tabs();
-				win.currentTab = tabs[tabs.length - 1];
+				const tab = safari.Tab();
+				win.tabs.push(tab);
+				win.currentTab = tab;
+				tab.url = url;
 			}} else {{
 				win.currentTab().url = url;
 			}}
 			"""
 		)
 		await asyncio.sleep(0.35)
+		await self._wait_for_expected_url(url)
+		await self._wait_for_document_ready()
 		await self._refresh_focus_target()
 
 	async def evaluate_javascript(self, expression: str) -> Any:
-		await self._ensure_profile_window()
+		window = await self._ensure_profile_window()
+		window_id = int(window['windowId'])
+		tab_index = int(window['currentTabIndex'])
 		output = await self._run_jxa(
 			f"""
 			const safari = Application("Safari");
 			safari.activate();
-			if (safari.windows.length === 0) {{
+			if (safari.windows().length === 0) {{
 				throw new Error("Safari has no open windows.");
 			}}
-			const result = safari.doJavaScript({json.dumps(expression)}, {{ in: safari.windows()[0].currentTab() }});
+			const win = safari.windows().find(w => w.id() === {window_id}) || safari.windows()[0];
+			const tabs = Array.from(win.tabs()).filter(Boolean);
+			const tab = tabs.find(t => t.index() === {tab_index}) || win.currentTab() || tabs[0];
+			if (!tab) {{
+				throw new Error("Safari has no initialized tabs.");
+			}}
+			const result = safari.doJavaScript({json.dumps(expression)}, {{ in: tab }});
 			if (result === undefined || result === null) {{
 				JSON.stringify({{type: "null", value: null}});
 			}} else if (typeof result === "string") {{
@@ -442,7 +515,7 @@ class SafariRealProfileBackend(BrowserBackend):
 			safari.activate();
 			const win = safari.windows().find(w => w.id() === {window_id});
 			if (!win) throw new Error("Safari window {window_id} not found");
-			const tab = win.tabs().find(t => t.index() === {tab_index});
+			const tab = Array.from(win.tabs()).filter(Boolean).find(t => t.index() === {tab_index});
 			if (!tab) throw new Error("Safari tab {tab_index} not found");
 			win.currentTab = tab;
 			"""
@@ -457,10 +530,12 @@ class SafariRealProfileBackend(BrowserBackend):
 			const safari = Application("Safari");
 			safari.activate();
 			const win = safari.windows().find(w => w.id() === {window_id});
-			if (!win) return;
-			const tab = win.tabs().find(t => t.index() === {tab_index});
-			if (!tab) return;
-			tab.close();
+			if (win) {{
+				const tab = Array.from(win.tabs()).filter(Boolean).find(t => t.index() === {tab_index});
+				if (tab) {{
+					tab.close();
+				}}
+			}}
 			"""
 		)
 		await asyncio.sleep(0.15)
@@ -474,20 +549,102 @@ class SafariRealProfileBackend(BrowserBackend):
 				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
 				if (!el) return {{ ok: false, error: 'not_found' }};
 				el.scrollIntoView({{ block: 'center', inline: 'center' }});
-				if (typeof el.focus === 'function') {{
-					el.focus({{ preventScroll: true }});
-				}}
 				const rect = el.getBoundingClientRect();
+				const clientX = rect.left + rect.width / 2;
+				const clientY = rect.top + rect.height / 2;
+				const hitTarget = document.elementFromPoint(clientX, clientY);
+				const interactiveSelector = [
+					'a',
+					'button',
+					'input',
+					'label',
+					'option',
+					'select',
+					'summary',
+					'textarea',
+					'[role="button"]',
+					'[role="link"]',
+					'[role="menuitem"]',
+					'[role="option"]',
+					'[onclick]',
+					'[tabindex]'
+				].join(',');
+				let target = hitTarget && el.contains(hitTarget) ? hitTarget : el;
+				target = target.closest(interactiveSelector) || el.closest(interactiveSelector) || target;
+				if (typeof target.focus === 'function') {{
+					target.focus({{ preventScroll: true }});
+				}}
+
+				const leftMouse = {{
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+					button: 0,
+					buttons: 1,
+					clientX,
+					clientY,
+					detail: 1,
+					view: window,
+				}};
+				const leftMouseUp = {{
+					...leftMouse,
+					buttons: 0,
+				}};
+				const rightMouse = {{
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+					button: 2,
+					buttons: 2,
+					clientX,
+					clientY,
+					detail: 1,
+					view: window,
+				}};
+				const rightMouseUp = {{
+					...rightMouse,
+					buttons: 0,
+				}};
+				const pointerInit = (button, buttons) => ({{
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+					button,
+					buttons,
+					clientX,
+					clientY,
+					pointerId: 1,
+					pointerType: 'mouse',
+					isPrimary: true,
+				}});
+				const dispatchPointer = (type, init) => {{
+					if (typeof PointerEvent === 'function') {{
+						target.dispatchEvent(new PointerEvent(type, init));
+					}}
+				}};
+
 				if ({json.dumps(button)} === 'right') {{
-					el.dispatchEvent(new MouseEvent('contextmenu', {{ bubbles: true, cancelable: true, button: 2, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }}));
+					dispatchPointer('pointerdown', pointerInit(2, 2));
+					target.dispatchEvent(new MouseEvent('mousedown', rightMouse));
+					dispatchPointer('pointerup', pointerInit(2, 0));
+					target.dispatchEvent(new MouseEvent('mouseup', rightMouseUp));
+					target.dispatchEvent(new MouseEvent('contextmenu', rightMouseUp));
 				}} else {{
-					if (typeof el.click === 'function') {{
-						el.click();
+					dispatchPointer('pointerdown', pointerInit(0, 1));
+					target.dispatchEvent(new MouseEvent('mousedown', leftMouse));
+					dispatchPointer('pointerup', pointerInit(0, 0));
+					target.dispatchEvent(new MouseEvent('mouseup', leftMouseUp));
+					if (typeof target.click === 'function') {{
+						target.click();
 					}} else {{
-						el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, button: 0, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }}));
+						target.dispatchEvent(new MouseEvent('click', leftMouseUp));
 					}}
 				}}
-				return {{ ok: true }};
+				return {{
+					ok: true,
+					targetTag: target.tagName ? target.tagName.toLowerCase() : null,
+					targetId: target.id || null,
+				}};
 			}})()
 			"""
 		)
@@ -558,14 +715,81 @@ class SafariRealProfileBackend(BrowserBackend):
 			(() => {{
 				const el = document.elementFromPoint({x}, {y});
 				if (!el) return {{ ok: false, error: 'not_found' }};
-				if ({json.dumps(button)} === 'right') {{
-					el.dispatchEvent(new MouseEvent('contextmenu', {{ bubbles: true, cancelable: true, button: 2, clientX: {x}, clientY: {y} }}));
-				}} else if (typeof el.click === 'function') {{
-					el.click();
-				}} else {{
-					el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, button: 0, clientX: {x}, clientY: {y} }}));
+				const interactiveSelector = [
+					'a',
+					'button',
+					'input',
+					'label',
+					'option',
+					'select',
+					'summary',
+					'textarea',
+					'[role="button"]',
+					'[role="link"]',
+					'[role="menuitem"]',
+					'[role="option"]',
+					'[onclick]',
+					'[tabindex]'
+				].join(',');
+				const target = el.closest(interactiveSelector) || el;
+				if (typeof target.focus === 'function') {{
+					target.focus({{ preventScroll: true }});
 				}}
-				return {{ ok: true, tag: el.tagName.toLowerCase() }};
+				const dispatchPointer = (type, button, buttons) => {{
+					if (typeof PointerEvent === 'function') {{
+						target.dispatchEvent(
+							new PointerEvent(type, {{
+								bubbles: true,
+								cancelable: true,
+								composed: true,
+								button,
+								buttons,
+								clientX: {x},
+								clientY: {y},
+								pointerId: 1,
+								pointerType: 'mouse',
+								isPrimary: true,
+							}})
+						);
+					}}
+				}};
+				const dispatchMouse = (type, button, buttons) => {{
+					target.dispatchEvent(
+						new MouseEvent(type, {{
+							bubbles: true,
+							cancelable: true,
+							composed: true,
+							button,
+							buttons,
+							clientX: {x},
+							clientY: {y},
+							detail: 1,
+							view: window,
+						}})
+					);
+				}};
+				if ({json.dumps(button)} === 'right') {{
+					dispatchPointer('pointerdown', 2, 2);
+					dispatchMouse('mousedown', 2, 2);
+					dispatchPointer('pointerup', 2, 0);
+					dispatchMouse('mouseup', 2, 0);
+					dispatchMouse('contextmenu', 2, 0);
+				}} else {{
+					dispatchPointer('pointerdown', 0, 1);
+					dispatchMouse('mousedown', 0, 1);
+					dispatchPointer('pointerup', 0, 0);
+					dispatchMouse('mouseup', 0, 0);
+					if (typeof target.click === 'function') {{
+						target.click();
+					}} else {{
+						dispatchMouse('click', 0, 0);
+					}}
+				}}
+				return {{
+					ok: true,
+					tag: target.tagName.toLowerCase(),
+					targetId: target.id || null,
+				}};
 			}})()
 			"""
 		)
@@ -624,18 +848,22 @@ class SafariRealProfileBackend(BrowserBackend):
 		)
 
 	async def go_back(self) -> None:
+		previous_url = await self.get_current_page_url()
 		await self.evaluate_javascript('history.back(); true;')
-		await asyncio.sleep(0.25)
+		await self._wait_for_url_change(previous_url)
+		await self._wait_for_document_ready()
 		await self._refresh_focus_target()
 
 	async def go_forward(self) -> None:
+		previous_url = await self.get_current_page_url()
 		await self.evaluate_javascript('history.forward(); true;')
-		await asyncio.sleep(0.25)
+		await self._wait_for_url_change(previous_url)
+		await self._wait_for_document_ready()
 		await self._refresh_focus_target()
 
 	async def refresh(self) -> None:
 		await self.evaluate_javascript('location.reload(); true;')
-		await asyncio.sleep(0.35)
+		await self._wait_for_document_ready()
 		await self._refresh_focus_target()
 
 	async def send_keys(self, keys: str) -> None:
@@ -717,32 +945,49 @@ class SafariRealProfileBackend(BrowserBackend):
 			raise BrowserError(f'Text {text!r} was not found on the current Safari page.')
 
 	async def upload_file(self, node: EnhancedDOMTreeNode, file_path: str) -> None:
-		gui_report = await self._probe_gui_scripting()
-		if not gui_report:
-			raise BrowserError(
-				'Safari file upload requires Accessibility permission for GUI scripting. '
-				'Grant permission to your terminal/app in System Settings > Privacy & Security > Accessibility.'
-			)
+		absolute_path = Path(file_path).expanduser().resolve()
+		if not absolute_path.is_file():
+			raise BrowserError(f'Safari upload file not found: {absolute_path}')
 
-		absolute_path = str(Path(file_path).expanduser().resolve())
-		await self.click_element(node)
-		await asyncio.sleep(0.4)
-		await self._run_jxa(
+		encoded_bytes = base64.b64encode(absolute_path.read_bytes()).decode('ascii')
+		mime_type = mimetypes.guess_type(absolute_path.name)[0] or 'application/octet-stream'
+		result = await self.evaluate_javascript(
 			f"""
-			const currentApp = Application.currentApplication();
-			currentApp.includeStandardAdditions = true;
-			const safari = Application("Safari");
-			safari.activate();
-			const se = Application("System Events");
-			se.keystroke("g", {{ using: ["command down", "shift down"] }});
-			currentApp.delay(0.15);
-			se.keystroke({json.dumps(absolute_path)});
-			currentApp.delay(0.1);
-			se.keyCode(36);
-			currentApp.delay(0.15);
-			se.keyCode(36);
+				(() => {{
+					const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
+					if (!el) return {{ ok: false, error: 'not_found' }};
+					if (el.tagName !== 'INPUT' || (el.type || '').toLowerCase() !== 'file') {{
+						return {{
+							ok: false,
+							error: 'not_file_input',
+							tagName: el.tagName,
+							type: el.type || null,
+							id: el.id || null,
+							outerHTML: el.outerHTML || null,
+						}};
+					}}
+
+				const bytes = Uint8Array.from(atob({json.dumps(encoded_bytes)}), char => char.charCodeAt(0));
+				const file = new File([bytes], {json.dumps(absolute_path.name)}, {{ type: {json.dumps(mime_type)} }});
+				const transfer = new DataTransfer();
+				transfer.items.add(file);
+				el.files = transfer.files;
+				el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+				el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+				return {{ ok: true, name: file.name, size: file.size }};
+			}})()
 			"""
 		)
+		if not isinstance(result, dict) or not result.get('ok'):
+			error = result.get('error') if isinstance(result, dict) else None
+			raise BrowserError(
+				'Safari file upload failed.',
+				details={
+					'file_path': str(absolute_path),
+					'error': error or 'unexpected_result',
+					'result': result,
+				},
+			)
 
 	async def _probe_capabilities(self) -> BackendCapabilityReport:
 		profile = self.browser_session.browser_profile.safari_profile or 'active'
@@ -753,23 +998,36 @@ class SafariRealProfileBackend(BrowserBackend):
 
 	async def _ensure_profile_window(self) -> dict[str, Any]:
 		profile = (self.browser_session.browser_profile.safari_profile or 'active').strip() or 'active'
-		await self._run_jxa(
+		window_probe = await self._run_jxa_json(
 			"""
-			const currentApp = Application.currentApplication();
-			currentApp.includeStandardAdditions = true;
 			const safari = Application("Safari");
 			safari.activate();
-			if (safari.windows.length === 0) {
-				safari.Document().make();
-				currentApp.delay(0.2);
-			}
+			JSON.stringify({ windowCount: safari.windows().length });
 			"""
 		)
+		if int(window_probe.get('windowCount', 0)) == 0:
+			await asyncio.to_thread(
+				_run_applescript_sync,
+				"""
+				tell application "Safari" to activate
+				tell application "System Events"
+					keystroke "n" using {command down}
+				end tell
+				delay 0.2
+				""",
+			)
 
 		if profile.lower() != 'active':
 			focused = await self._focus_existing_profile_window(profile)
 			if not focused:
 				await self._open_profile_window(profile)
+
+		if profile.lower() == 'active':
+			preferred_window_id = self._focused_window_id()
+			if preferred_window_id is not None:
+				preferred_window = await self._get_window_snapshot(preferred_window_id)
+				if preferred_window is not None:
+					return preferred_window
 
 		window = await self._get_front_window()
 		if profile.lower() != 'active':
@@ -790,15 +1048,16 @@ class SafariRealProfileBackend(BrowserBackend):
 			safari.activate();
 			const profile = {json.dumps(profile)};
 			const separator = {json.dumps(PROFILE_TITLE_SEPARATOR)};
+			let focused = false;
 			for (const win of safari.windows()) {{
 				const title = win.name() || "";
 				if (title.startsWith(profile + separator) || title === profile) {{
 					win.index = 1;
-					JSON.stringify({{ focused: true }});
+					focused = true;
 					break;
 				}}
 			}}
-			JSON.stringify({{ focused: false }});
+			JSON.stringify({{ focused }});
 			"""
 		)
 		return bool(result.get('focused'))
@@ -814,8 +1073,6 @@ class SafariRealProfileBackend(BrowserBackend):
 		item_name = f'New {profile} Window'
 		result = await self._run_jxa_json(
 			f"""
-			const currentApp = Application.currentApplication();
-			currentApp.includeStandardAdditions = true;
 			const safari = Application("Safari");
 			safari.activate();
 			const se = Application("System Events");
@@ -823,50 +1080,125 @@ class SafariRealProfileBackend(BrowserBackend):
 			const fileMenu = proc.menuBars[0].menuBarItems.byName("File").menus[0];
 			const itemName = {json.dumps(item_name)};
 			const exists = fileMenu.menuItems.name().includes(itemName);
-			if (!exists) {{
-				JSON.stringify({{ opened: false, reason: "missing_menu_item" }});
-			}} else {{
-				fileMenu.menuItems.byName(itemName).click();
-				currentApp.delay(0.4);
-				JSON.stringify({{ opened: true }});
-			}}
+			JSON.stringify({{ exists }});
 			"""
 		)
-		if not result.get('opened'):
+		if not result.get('exists'):
 			raise BrowserError(
 				f'Safari does not expose File > {item_name}. '
 				'Make sure that profile exists in Safari and is available in the current Safari 26.3.1+ build.',
 				details=result,
 			)
+		await asyncio.to_thread(
+			_run_applescript_sync,
+			f'''
+			tell application "Safari" to activate
+			tell application "System Events"
+				tell process "Safari"
+					click menu item "{item_name}" of menu 1 of menu bar item "File" of menu bar 1
+				end tell
+			end tell
+			delay 0.4
+			''',
+		)
 
 	async def _get_front_window(self) -> dict[str, Any]:
-		window = await self._run_jxa_json(
-			"""
-			const safari = Application("Safari");
-			safari.activate();
-			if (safari.windows.length === 0) {
-				JSON.stringify({windowId: 0, windowName: "", currentTabIndex: 1, title: "", url: "about:blank"});
-			} else {
-				const win = safari.windows()[0];
-				const tab = win.currentTab();
-				JSON.stringify({
-					windowId: win.id(),
-					windowName: win.name() || "",
-					currentTabIndex: tab.index(),
-					title: tab.name() || "",
-					url: tab.url() || "about:blank",
-				});
-			}
-			"""
-		)
+		window = await self._get_window_snapshot()
+		if window is None:
+			raise BrowserError('Safari did not report an active window.')
 		return window
 
 	async def _refresh_focus_target(self) -> None:
-		window = await self._get_front_window()
+		preferred_window_id = self._focused_window_id()
+		window = await self._get_window_snapshot(preferred_window_id) if preferred_window_id is not None else None
+		if window is None:
+			window = await self._get_front_window()
 		self.browser_session.agent_focus_target_id = self._target_id(
 			int(window['windowId']),
 			int(window['currentTabIndex']),
 		)
+
+	def _focused_window_id(self) -> int | None:
+		target_id = self.browser_session.agent_focus_target_id
+		if not target_id:
+			return None
+		try:
+			window_id, _ = self._parse_target_id(target_id)
+		except BrowserError:
+			return None
+		return window_id
+
+	async def _get_window_snapshot(self, window_id: int | None = None) -> dict[str, Any] | None:
+		window = await self._run_jxa_json(
+			f"""
+			const safari = Application("Safari");
+			safari.activate();
+			const targetWindowId = {json.dumps(window_id)};
+			if (safari.windows().length === 0) {{
+				JSON.stringify({{windowId: 0, windowName: "", currentTabIndex: 1, title: "", url: "about:blank"}});
+			}} else {{
+				const win = targetWindowId === null
+					? safari.windows()[0]
+					: safari.windows().find(w => w.id() === targetWindowId);
+				if (!win) {{
+					JSON.stringify(null);
+				}} else {{
+					const tabs = Array.from(win.tabs()).filter(Boolean);
+					const tab = win.currentTab() || tabs[0] || null;
+					if (!tab) {{
+						JSON.stringify({{
+							windowId: win.id(),
+							windowName: win.name() || "",
+							currentTabIndex: 1,
+							title: "",
+							url: "about:blank",
+						}});
+					}} else {{
+					JSON.stringify({{
+						windowId: win.id(),
+						windowName: win.name() || "",
+						currentTabIndex: tab.index(),
+						title: tab.name() || "",
+						url: tab.url() || "about:blank",
+					}});
+					}}
+				}}
+			}}
+			"""
+		)
+		return window
+
+	async def _wait_for_url_change(self, previous_url: str, timeout: float = 3.0) -> str:
+		deadline = asyncio.get_running_loop().time() + timeout
+		current_url = previous_url
+		while asyncio.get_running_loop().time() < deadline:
+			current_url = await self.get_current_page_url()
+			if current_url != previous_url:
+				return current_url
+			await asyncio.sleep(0.1)
+		return current_url
+
+	async def _wait_for_expected_url(self, expected_url: str, timeout: float = 5.0) -> str:
+		deadline = asyncio.get_running_loop().time() + timeout
+		current_url = await self.get_current_page_url()
+		while asyncio.get_running_loop().time() < deadline:
+			current_url = await self.get_current_page_url()
+			if current_url == expected_url:
+				return current_url
+			await asyncio.sleep(0.1)
+		return current_url
+
+	async def _wait_for_document_ready(self, timeout: float = 3.0) -> str | None:
+		deadline = asyncio.get_running_loop().time() + timeout
+		while asyncio.get_running_loop().time() < deadline:
+			try:
+				ready_state = await self.evaluate_javascript('document.readyState')
+			except Exception:
+				ready_state = None
+			if ready_state == 'complete':
+				return ready_state
+			await asyncio.sleep(0.1)
+		return None
 
 	def _build_serialized_dom_state(self, state: dict[str, Any], target_id: str) -> SerializedDOMState:
 		selector_map: dict[int, EnhancedDOMTreeNode] = {}

@@ -1,7 +1,8 @@
 """Profile management command handlers.
 
-Unified profile management that works with both local Chrome profiles and cloud profiles.
-The behavior is determined by the browser mode (-b real, -b safari, or -b remote).
+Unified profile management that works with local Chrome profiles, local Safari
+profiles, and cloud profiles. The behavior is determined by the browser mode
+(-b real, -b safari, or -b remote).
 """
 
 import argparse
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 ProfileMode = Literal['real', 'safari', 'remote']
+SAFARI_PROFILE_SELECTION_HINT = 'Use --browser safari --profile <label> to target a Safari profile by name.'
+SAFARI_PROFILE_SETTINGS_HINT = 'Manage Safari profiles in Safari, then reuse the profile label in browser-use.'
 
 
 class ProfileModeError(Exception):
@@ -33,7 +36,7 @@ def get_profile_mode(args: argparse.Namespace) -> ProfileMode:
 		args: Parsed command-line arguments with browser attribute
 
 	Returns:
-		'real' for local Chrome profiles, 'safari' for Safari profile bindings, 'remote' for cloud profiles
+		'real' for local Chrome profiles, 'safari' for local Safari profiles, 'remote' for cloud profiles
 
 	Raises:
 		ProfileModeError: If mode cannot be determined or chromium mode is used
@@ -131,7 +134,7 @@ def _print_usage() -> None:
 	print()
 	print('The -b flag determines which profile system to use:')
 	print('  -b real           Local Chrome profiles')
-	print('  -b safari         Local Safari profile bindings')
+	print('  -b safari         Local Safari profiles')
 	print('  -b remote         Cloud profiles (requires API key)')
 
 
@@ -167,30 +170,71 @@ def _list_local_profiles(args: argparse.Namespace) -> int:
 	return 0
 
 
-def _list_local_safari_profiles(args: argparse.Namespace) -> int:
-	"""List locally bound Safari profiles."""
-	from browser_use.browser.safari.profiles import SafariProfileStore
+def _extract_safari_profile_label(menu_item_name: str) -> str | None:
+	"""Extract a Safari profile label from a File menu item name."""
+	prefix = 'New '
+	suffix = ' Window'
+	if not menu_item_name.startswith(prefix) or not menu_item_name.endswith(suffix):
+		return None
 
-	profiles = [
-		{
-			'id': binding.label,
-			'name': binding.label,
-			'profile_identifier': binding.profile_identifier,
-			'last_seen_target_id': binding.last_seen_target_id,
-		}
-		for binding in SafariProfileStore().list_bindings()
-	]
+	label = menu_item_name[len(prefix) : -len(suffix)].strip()
+	if not label or label.casefold() == 'private':
+		return None
+	return label
+
+
+def _discover_local_safari_profiles() -> tuple[list[dict[str, str]], str | None]:
+	"""Discover Safari profile labels from Safari's File menu.
+
+	The active JXA backend selects named Safari profiles through File > New <profile> Window.
+	Expose those labels directly so CLI messaging matches the runtime behavior.
+	"""
+	from browser_use.browser.backends.safari_backend import _run_jxa_sync
+
+	discovery_error: str | None = None
+	menu_items: list[str] = []
+
+	try:
+		raw = _run_jxa_sync(
+			"""
+			const safari = Application("Safari");
+			safari.activate();
+			const se = Application("System Events");
+			const proc = se.processes.byName("Safari");
+			const fileMenu = proc.menuBars[0].menuBarItems.byName("File").menus[0];
+			JSON.stringify(fileMenu.menuItems.name());
+			""",
+			timeout=5,
+		)
+		parsed = json.loads(raw) if raw else []
+		if isinstance(parsed, list):
+			menu_items = [str(item) for item in parsed]
+	except Exception as exc:
+		discovery_error = str(exc)
+
+	profiles = [{'id': 'active', 'name': 'active', 'selection': 'Frontmost Safari window'}]
+	profile_labels = {label for item in menu_items if (label := _extract_safari_profile_label(item)) is not None}
+	for label in sorted(profile_labels, key=str.casefold):
+		profiles.append({'id': label, 'name': label, 'selection': f'File > New {label} Window'})
+
+	return profiles, discovery_error
+
+
+def _list_local_safari_profiles(args: argparse.Namespace) -> int:
+	"""List Safari profile labels discoverable by the local Safari backend."""
+	profiles, discovery_error = _discover_local_safari_profiles()
 
 	if getattr(args, 'json', False):
-		print(json.dumps({'profiles': profiles}))
+		payload: dict[str, Any] = {'profiles': profiles}
+		if discovery_error:
+			payload['discovery_error'] = discovery_error
+		print(json.dumps(payload))
 	else:
-		if profiles:
-			print('Safari profiles:')
-			for profile in profiles:
-				target_suffix = f' [{profile["last_seen_target_id"]}]' if profile['last_seen_target_id'] else ''
-				print(f'  {profile["id"]}: {profile["profile_identifier"]}{target_suffix}')
-		else:
-			print('No Safari profile bindings found')
+		print('Safari profiles:')
+		for profile in profiles:
+			print(f'  {profile["id"]}: {profile["selection"]}')
+		if discovery_error:
+			print('  note: named profile discovery is unavailable; run `browser-use doctor` if expected labels are missing.')
 
 	return 0
 
@@ -268,28 +312,25 @@ def _get_local_profile(args: argparse.Namespace) -> int:
 
 
 def _get_local_safari_profile(args: argparse.Namespace) -> int:
-	"""Get a locally bound Safari profile."""
-	from browser_use.browser.safari.profiles import SafariProfileStore
-
+	"""Get a Safari profile label discoverable by the local Safari backend."""
 	profile_id = args.id
-	binding = SafariProfileStore().get_binding(profile_id)
-	if binding is None:
+	profiles, discovery_error = _discover_local_safari_profiles()
+	profile = next((item for item in profiles if item['id'] == profile_id or item['name'] == profile_id), None)
+	if profile is None:
 		print(f'Error: Safari profile "{profile_id}" not found', file=sys.stderr)
+		if discovery_error:
+			print(
+				"Browser Use discovers Safari profile labels from Safari's File menu. "
+				'Open Safari and rerun `browser-use doctor` to confirm Accessibility access.',
+				file=sys.stderr,
+			)
 		return 1
 
-	data = {
-		'id': binding.label,
-		'name': binding.label,
-		'profile_identifier': binding.profile_identifier,
-		'last_seen_target_id': binding.last_seen_target_id,
-	}
 	if getattr(args, 'json', False):
-		print(json.dumps(data))
+		print(json.dumps(profile))
 	else:
-		print(f'Profile: {binding.label}')
-		print(f'  Identifier: {binding.profile_identifier}')
-		if binding.last_seen_target_id:
-			print(f'  Last seen tab: {binding.last_seen_target_id}')
+		print(f'Profile: {profile["id"]}')
+		print(f'  Selection: {profile["selection"]}')
 	return 0
 
 
@@ -340,7 +381,8 @@ def _handle_create(args: argparse.Namespace, mode: ProfileMode) -> int:
 		return 1
 	if mode == 'safari':
 		print('Error: Cannot create Safari profiles via CLI.', file=sys.stderr)
-		print('Create Safari profiles in Safari and then bind them through the Safari companion host.', file=sys.stderr)
+		print(SAFARI_PROFILE_SETTINGS_HINT, file=sys.stderr)
+		print(SAFARI_PROFILE_SELECTION_HINT, file=sys.stderr)
 		return 1
 
 	return _create_cloud_profile(args)
@@ -383,8 +425,9 @@ def _handle_update(args: argparse.Namespace, mode: ProfileMode) -> int:
 		print('Use Chrome browser settings to update profiles.', file=sys.stderr)
 		return 1
 	if mode == 'safari':
-		print('Error: Cannot rename Safari profile bindings via CLI yet.', file=sys.stderr)
-		print('Rebind the profile label from the Safari companion host instead.', file=sys.stderr)
+		print('Error: Cannot rename Safari profiles via CLI.', file=sys.stderr)
+		print(SAFARI_PROFILE_SETTINGS_HINT, file=sys.stderr)
+		print('Rename the profile in Safari, then use the new label with `--browser safari --profile <label>`.', file=sys.stderr)
 		return 1
 
 	return _update_cloud_profile(args)
@@ -427,8 +470,9 @@ def _handle_delete(args: argparse.Namespace, mode: ProfileMode) -> int:
 		print('Use Chrome browser settings to remove profiles.', file=sys.stderr)
 		return 1
 	if mode == 'safari':
-		print('Error: Cannot delete Safari profile bindings via CLI yet.', file=sys.stderr)
-		print('Remove or update the binding from the Safari companion host or the local bindings file.', file=sys.stderr)
+		print('Error: Cannot delete Safari profiles via CLI.', file=sys.stderr)
+		print(SAFARI_PROFILE_SETTINGS_HINT, file=sys.stderr)
+		print('Delete the profile in Safari settings if you no longer want Browser Use to target it.', file=sys.stderr)
 		return 1
 
 	return _delete_cloud_profile(args)
@@ -468,8 +512,11 @@ def _handle_cookies(args: argparse.Namespace, mode: ProfileMode) -> int:
 		print('Use -b real to access local profile cookies.', file=sys.stderr)
 		return 1
 	if mode == 'safari':
-		print('Error: Cookie listing is not available for Safari profile bindings.', file=sys.stderr)
-		print('Safari backend operates on real profile windows and does not expose cookies directly.', file=sys.stderr)
+		print('Error: Cookie listing is not available for Safari local profiles.', file=sys.stderr)
+		print(
+			'Safari automation uses the live Safari app and does not expose raw cookie storage through this command.',
+			file=sys.stderr,
+		)
 		return 1
 
 	return _list_profile_cookies(args)

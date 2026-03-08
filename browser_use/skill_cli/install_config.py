@@ -172,14 +172,14 @@ def get_mode_unavailable_error(mode: str) -> str:
 		mode_desc = 'Local Chromium browser mode'
 	elif mode in SAFARI_LOCAL_MODES:
 		install_flag = '--full'
-		mode_desc = 'Safari real-profile mode'
+		mode_desc = 'Local Safari browser mode'
 	else:
 		install_flag = '--full'
 		mode_desc = 'Remote browser mode'
 
 	extra_help = ''
 	if mode == 'safari':
-		extra_help = '\nSafari mode also requires Safari 26.3.1+ and macOS 26+.'
+		extra_help = '\nSafari mode uses the built-in local Safari backend and requires Safari 26.3.1+ on macOS 26+.'
 
 	return (
 		f"Error: {mode_desc} '{mode}' not installed.\n"

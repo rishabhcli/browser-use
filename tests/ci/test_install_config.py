@@ -231,6 +231,18 @@ class TestInstallConfig:
 		assert 'remote' in error  # Shows available modes
 		assert '--full' in error  # Shows reinstall instructions
 
+	def test_get_mode_unavailable_error_message_for_safari(self, temp_config_dir: Path):
+		"""Safari unavailable message should describe the local backend requirements."""
+		from browser_use.skill_cli.install_config import get_mode_unavailable_error, save_config
+
+		save_config(['remote'], 'remote')
+
+		error = get_mode_unavailable_error('safari')
+		assert 'Local Safari browser mode' in error
+		assert 'built-in local Safari backend' in error
+		assert 'Safari 26.3.1+' in error
+		assert 'companion host' not in error.lower()
+
 	def test_no_config_file_means_all_modes_available(self, temp_config_dir: Path):
 		"""pip install users (no config file) have all modes available."""
 		from browser_use.skill_cli.install_config import (

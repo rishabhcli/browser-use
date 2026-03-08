@@ -385,8 +385,12 @@ class Registry(Generic[Context]):
 				except Exception:
 					special_context['page_url'] = None
 
-				# Add cdp_client
-				special_context['cdp_client'] = browser_session.cdp_client
+				# Only inject CDP for backends that actually expose it.
+				# Safari intentionally has no CDP client, and touching the property raises.
+				if browser_session.get_backend_capabilities().supports_cdp:
+					special_context['cdp_client'] = browser_session.cdp_client
+				else:
+					special_context['cdp_client'] = None
 
 			# All functions are now normalized to accept kwargs only
 			# Call with params and unpacked special context

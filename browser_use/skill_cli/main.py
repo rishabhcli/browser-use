@@ -18,6 +18,43 @@ import tempfile
 import time
 from pathlib import Path
 
+_LOCAL_ENV_KEYS = {
+	'BROWSER_USE_API_KEY',
+	'OPENAI_API_KEY',
+	'ANTHROPIC_API_KEY',
+	'GOOGLE_API_KEY',
+}
+
+
+def _load_local_env_file(env_path: Path | None = None) -> None:
+	"""Load common API keys from a local .env file without importing python-dotenv."""
+	path = env_path or (Path.cwd() / '.env')
+	if not path.exists():
+		return
+
+	try:
+		for raw_line in path.read_text().splitlines():
+			line = raw_line.strip()
+			if not line or line.startswith('#'):
+				continue
+			if line.startswith('export '):
+				line = line[len('export ') :].strip()
+			if '=' not in line:
+				continue
+			key, value = line.split('=', 1)
+			key = key.strip()
+			if key not in _LOCAL_ENV_KEYS or key in os.environ:
+				continue
+			value = value.strip()
+			if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+				value = value[1:-1]
+			os.environ[key] = value
+	except OSError:
+		return
+
+
+_load_local_env_file()
+
 # =============================================================================
 # Early command interception (before heavy imports)
 # These commands don't need the session server infrastructure
@@ -424,6 +461,9 @@ def send_command(session: str, action: str, params: dict) -> dict:
 
 	sock = connect_to_server(session)
 	try:
+		if action in {'run', 'python'}:
+			sock.settimeout(None)
+
 		# Send request
 		sock.sendall((json.dumps(request) + '\n').encode())
 
@@ -1319,6 +1359,11 @@ def main() -> int:
 	for key, value in vars(args).items():
 		if key not in skip_keys and value is not None:
 			params[key] = value
+
+	if args.command == 'run':
+		env_overrides = {key: value for key in _LOCAL_ENV_KEYS if (value := os.environ.get(key))}
+		if env_overrides:
+			params['_env_overrides'] = env_overrides
 
 	# Add profile to params for commands that need it (agent tasks, etc.)
 	# Note: profile is passed to ensure_server for local browser profile,

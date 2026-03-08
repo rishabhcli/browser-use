@@ -58,7 +58,7 @@ def _check_package() -> dict[str, Any]:
 		return {
 			'status': 'error',
 			'message': 'browser-use not installed',
-			'fix': 'pip install browser-use',
+			'fix': 'uv pip install browser-use',
 		}
 
 
@@ -82,41 +82,46 @@ def _check_browser() -> dict[str, Any]:
 
 
 def _check_safari_backend() -> dict[str, Any]:
-	"""Check if the local Safari real-profile backend is ready."""
-	from browser_use.browser.backends.safari_backend import probe_local_safari_backend
+	"""Check if the built-in local Safari backend is ready."""
+	from browser_use.browser.backends.base import BackendCapabilityReport
+	from browser_use.browser.session import BrowserSession
 
-	report = probe_local_safari_backend()
-	details = report.details
-	version = details.get('safari_version') or 'unknown'
+	session = BrowserSession(automation_backend='safari', headless=False)
+	capabilities = session.get_backend_capabilities()
+	report = session.backend_capabilities
+	details = report.details if isinstance(report, BackendCapabilityReport) else {}
+	version = capabilities.browser_version or details.get('safari_version') or 'unknown'
 	macos_version = details.get('macos_version') or 'unknown'
+	note = f'Safari {version} on macOS {macos_version}; used by --browser safari.'
 
-	if not report.available:
+	if not capabilities.supported:
 		result: dict[str, Any] = {
 			'status': 'warning',
-			'message': report.reason or 'Safari real-profile backend unavailable',
-			'note': f'Safari {version} on macOS {macos_version}',
+			'message': capabilities.issues[0] if capabilities.issues else 'Safari local backend unavailable',
+			'note': note,
 		}
 		if details:
 			result['details'] = details
 		return result
 
 	missing_features: list[str] = []
-	if not details.get('gui_scripting_available'):
+	if capabilities.accessibility_permission != 'granted':
 		missing_features.append('Accessibility / GUI scripting')
-	if not details.get('screen_capture_available'):
+	if capabilities.screen_recording_permission != 'granted':
 		missing_features.append('Screen Recording screenshots')
 
 	if missing_features:
 		return {
 			'status': 'warning',
-			'message': f'Safari backend available with limitations ({", ".join(missing_features)} missing)',
-			'note': f'Safari {version} on macOS {macos_version}',
+			'message': f'Safari local backend available with limitations ({", ".join(missing_features)} missing)',
+			'note': note,
 			'details': details,
 		}
 
 	return {
 		'status': 'ok',
-		'message': f'Safari backend available (Safari {version}, macOS {macos_version})',
+		'message': f'Safari local backend available (Safari {version}, macOS {macos_version})',
+		'note': note,
 		'details': details,
 	}
 

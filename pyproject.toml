@@ -190,6 +190,7 @@ markers = [
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
     "asyncio: mark tests as async tests",
+    "safari_live: marks tests that require a local macOS Safari runtime",
 ]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]

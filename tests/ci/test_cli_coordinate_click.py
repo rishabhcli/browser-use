@@ -335,7 +335,7 @@ class TestClickCommandHandler:
 			await handle('switch', session_info, {'tab': 0})
 
 	async def test_safari_rightclick_handler_uses_backend(self):
-		"""Safari rightclick should delegate to the Safari backend instead of erroring."""
+		"""Safari rightclick should go through the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -350,13 +350,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-
-		class SafariBackendStub:
-			def __init__(self) -> None:
-				self.click_element = AsyncMock(return_value={'ok': True})
-
-		backend = SafariBackendStub()
-		object.__setattr__(session, '_backend', backend)
+		right_click_element = AsyncMock(return_value={'ok': True})
+		object.__setattr__(session, 'right_click_element', right_click_element)
 
 		session_info = SessionInfo(
 			name='test',
@@ -369,10 +364,10 @@ class TestClickCommandHandler:
 		result = await handle('rightclick', session_info, {'index': 7})
 
 		assert result == {'right_clicked': 7}
-		backend.click_element.assert_awaited_once_with(node, button='right')
+		right_click_element.assert_awaited_once_with(node)
 
 	async def test_safari_hover_handler_uses_backend(self):
-		"""Safari hover should delegate to the Safari backend instead of erroring."""
+		"""Safari hover should go through the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -387,13 +382,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-
-		class SafariBackendStub:
-			def __init__(self) -> None:
-				self.hover_element = AsyncMock(return_value={'ok': True})
-
-		backend = SafariBackendStub()
-		object.__setattr__(session, '_backend', backend)
+		hover_element = AsyncMock(return_value={'ok': True})
+		object.__setattr__(session, 'hover_element', hover_element)
 
 		session_info = SessionInfo(
 			name='test',
@@ -406,10 +396,10 @@ class TestClickCommandHandler:
 		result = await handle('hover', session_info, {'index': 4})
 
 		assert result == {'hovered': 4}
-		backend.hover_element.assert_awaited_once_with(node)
+		hover_element.assert_awaited_once_with(node)
 
 	async def test_safari_dblclick_handler_uses_backend(self):
-		"""Safari double click should delegate to the Safari backend instead of erroring."""
+		"""Safari double click should go through the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -424,13 +414,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-
-		class SafariBackendStub:
-			def __init__(self) -> None:
-				self.double_click_element = AsyncMock(return_value={'ok': True})
-
-		backend = SafariBackendStub()
-		object.__setattr__(session, '_backend', backend)
+		double_click_element = AsyncMock(return_value={'ok': True})
+		object.__setattr__(session, 'double_click_element', double_click_element)
 
 		session_info = SessionInfo(
 			name='test',
@@ -443,10 +428,10 @@ class TestClickCommandHandler:
 		result = await handle('dblclick', session_info, {'index': 9})
 
 		assert result == {'double_clicked': 9}
-		backend.double_click_element.assert_awaited_once_with(node)
+		double_click_element.assert_awaited_once_with(node)
 
-	async def test_safari_get_value_handler_uses_evaluate_javascript(self):
-		"""Safari get value should use in-page JS rather than CDP-only access."""
+	async def test_safari_get_value_handler_uses_session_helper(self):
+		"""Safari get value should use the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -461,8 +446,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-		evaluate_javascript = AsyncMock(return_value='hello from safari')
-		object.__setattr__(session, 'evaluate_javascript', evaluate_javascript)
+		get_element_value = AsyncMock(return_value='hello from safari')
+		object.__setattr__(session, 'get_element_value', get_element_value)
 
 		session_info = SessionInfo(
 			name='test',
@@ -475,20 +460,16 @@ class TestClickCommandHandler:
 		result = await handle('get', session_info, {'get_command': 'value', 'index': 3})
 
 		assert result == {'index': 3, 'value': 'hello from safari'}
-		evaluate_javascript.assert_awaited_once()
+		get_element_value.assert_awaited_once_with(node)
 
-	async def test_safari_get_bbox_handler_uses_node_absolute_position(self):
-		"""Safari get bbox should use the DOM node position instead of CDP."""
+	async def test_safari_get_bbox_handler_uses_session_helper(self):
+		"""Safari get bbox should use the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
-		from browser_use.dom.views import DOMRect
 		from browser_use.skill_cli.commands.browser import handle
 		from browser_use.skill_cli.sessions import SessionInfo
 
-		node = _make_dom_node(
-			node_name='INPUT',
-			absolute_position=DOMRect(x=12.0, y=24.0, width=320.0, height=48.0),
-		)
+		node = _make_dom_node(node_name='INPUT')
 		session = BrowserSession(
 			browser_profile=BrowserProfile(
 				automation_backend='safari',
@@ -497,6 +478,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
+		get_element_bounding_box = AsyncMock(return_value={'x': 12.0, 'y': 24.0, 'width': 320.0, 'height': 48.0})
+		object.__setattr__(session, 'get_element_bounding_box', get_element_bounding_box)
 
 		session_info = SessionInfo(
 			name='test',
@@ -512,9 +495,10 @@ class TestClickCommandHandler:
 			'index': 5,
 			'bbox': {'x': 12.0, 'y': 24.0, 'width': 320.0, 'height': 48.0},
 		}
+		get_element_bounding_box.assert_awaited_once_with(node)
 
-	async def test_safari_get_text_handler_uses_evaluate_javascript(self):
-		"""Safari get text should read from the live DOM instead of the cached node snapshot."""
+	async def test_safari_get_text_handler_uses_session_helper(self):
+		"""Safari get text should use the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -529,8 +513,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-		evaluate_javascript = AsyncMock(return_value='live safari text')
-		object.__setattr__(session, 'evaluate_javascript', evaluate_javascript)
+		get_element_text = AsyncMock(return_value='live safari text')
+		object.__setattr__(session, 'get_element_text', get_element_text)
 
 		session_info = SessionInfo(
 			name='test',
@@ -543,10 +527,10 @@ class TestClickCommandHandler:
 		result = await handle('get', session_info, {'get_command': 'text', 'index': 6})
 
 		assert result == {'index': 6, 'text': 'live safari text'}
-		evaluate_javascript.assert_awaited_once()
+		get_element_text.assert_awaited_once_with(node)
 
-	async def test_safari_get_attributes_handler_uses_evaluate_javascript(self):
-		"""Safari get attributes should read live DOM attributes instead of the cached node snapshot."""
+	async def test_safari_get_attributes_handler_uses_session_helper(self):
+		"""Safari get attributes should use the shared BrowserSession helper."""
 		from browser_use.browser.profile import BrowserProfile
 		from browser_use.browser.session import BrowserSession
 		from browser_use.skill_cli.commands.browser import handle
@@ -562,8 +546,8 @@ class TestClickCommandHandler:
 			)
 		)
 		object.__setattr__(session, 'get_element_by_index', AsyncMock(return_value=node))
-		evaluate_javascript = AsyncMock(return_value={'role': 'button', 'data-live': 'fresh'})
-		object.__setattr__(session, 'evaluate_javascript', evaluate_javascript)
+		get_element_attributes = AsyncMock(return_value={'role': 'button', 'data-live': 'fresh'})
+		object.__setattr__(session, 'get_element_attributes', get_element_attributes)
 
 		session_info = SessionInfo(
 			name='test',
@@ -576,7 +560,42 @@ class TestClickCommandHandler:
 		result = await handle('get', session_info, {'get_command': 'attributes', 'index': 8})
 
 		assert result == {'index': 8, 'attributes': {'role': 'button', 'data-live': 'fresh'}}
-		evaluate_javascript.assert_awaited_once()
+		get_element_attributes.assert_awaited_once_with(node)
+
+	async def test_safari_cookies_handler_uses_capability_report(self):
+		"""Unsupported cookie access should come from the backend capability contract."""
+		from browser_use.browser.profile import BrowserProfile
+		from browser_use.browser.session import BrowserSession
+		from browser_use.skill_cli.commands.browser import handle
+		from browser_use.skill_cli.sessions import SessionInfo
+
+		session = BrowserSession(
+			browser_profile=BrowserProfile(
+				automation_backend='safari',
+				safari_profile='active',
+				headless=False,
+			)
+		)
+		get_backend_capabilities = MagicMock(
+			return_value=MagicMock(
+				supports_cookie_access=False,
+				browser_name='Safari',
+			)
+		)
+		object.__setattr__(session, 'get_backend_capabilities', get_backend_capabilities)
+
+		session_info = SessionInfo(
+			name='test',
+			browser_mode='safari',
+			headed=True,
+			profile='active',
+			browser_session=session,
+		)
+
+		result = await handle('cookies', session_info, {'cookies_command': 'get'})
+
+		assert result == {'error': 'Cookie operations are not available for the Safari backend'}
+		get_backend_capabilities.assert_called_once_with()
 
 
 class TestExtractCommandHandler:

@@ -151,6 +151,35 @@ class TestActionRegistryParameterPatterns:
 		assert 'Text: hello, URL:' in result.extracted_content
 		assert base_url in result.extracted_content
 
+	async def test_browser_injection_does_not_require_cdp_for_non_cdp_backends(self, registry):
+		"""Actions that only need browser_session should not touch cdp_client on non-CDP backends."""
+
+		class FakeCapabilities:
+			supports_cdp = False
+
+		class FakeSafariSession:
+			def get_backend_capabilities(self):
+				return FakeCapabilities()
+
+			async def get_current_page_url(self):
+				return 'safari://active'
+
+			@property
+			def cdp_client(self):
+				raise AssertionError('Registry should not access cdp_client for non-CDP backends')
+
+		@registry.action('Action with browser_session only')
+		async def action_with_browser_only(browser_session):
+			return ActionResult(extracted_content=await browser_session.get_current_page_url())
+
+		result = await registry.execute_action(
+			'action_with_browser_only',
+			{},
+			browser_session=FakeSafariSession(),
+		)
+
+		assert result.extracted_content == 'safari://active'
+
 	async def test_pydantic_model_parameters(self, registry, browser_session, base_url):
 		"""Test action that takes a pydantic model as first parameter"""
 

@@ -181,6 +181,95 @@ jobs:
           retry_on: error
           command: pytest "tests/ci/${{ matrix.test_filename }}.py"
 
+  safari-parity:
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 20
+    env:
+      ANONYMIZED_TELEMETRY: 'false'
+      BROWSER_USE_CLOUD_SYNC: 'false'
+      BROWSER_USE_LOGGING_LEVEL: 'DEBUG'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          activate-environment: true
+
+      - name: Cache uv packages and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-venv-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-venv-
+
+      - run: uv sync --dev --all-extras
+
+      - name: Run Safari doctor preflight
+        run: |
+          uv run python -m browser_use.skill_cli.main --json doctor > safari-doctor.json
+          cat safari-doctor.json
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path('safari-doctor.json').read_text())
+          safari = report['checks']['safari']
+          if safari.get('status') != 'ok':
+              raise SystemExit(f'Safari doctor preflight failed: {safari}')
+          PY
+
+      - name: Collect Safari test targets
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+
+          static_targets = [
+              'tests/ci/test_profile_command.py',
+              'tests/ci/test_doctor_command.py',
+              'tests/ci/test_install_config.py',
+              'tests/ci/test_safari_support.py',
+              'tests/ci/test_safari_session_factory.py',
+              'tests/ci/browser/test_backend_parity_contract.py',
+          ]
+          dynamic_patterns = [
+              'tests/ci/**/*safari*parity*.py',
+              'tests/ci/**/*safari*contract*.py',
+              'tests/ci/**/*safari*live*.py',
+              'tests/ci/**/safari/*.py',
+          ]
+
+          seen: set[str] = set()
+          targets: list[str] = []
+
+          def add_target(path: str) -> None:
+              if path not in seen and Path(path).exists():
+                  seen.add(path)
+                  targets.append(path)
+
+          for path in static_targets:
+              add_target(path)
+
+          root = Path('.')
+          for pattern in dynamic_patterns:
+              for path in sorted(root.glob(pattern)):
+                  add_target(path.as_posix())
+
+          if not targets:
+              raise SystemExit('No Safari test targets found for safari-parity job.')
+
+          output_path = Path('.safari-test-targets')
+          output_path.write_text('\n'.join(targets) + '\n')
+          print('Safari parity targets:')
+          for target in targets:
+              print(f'  {target}')
+          PY
+
+      - name: Run Safari parity tests
+        run: xargs uv run pytest < .safari-test-targets
+
   evaluate-tasks:
     needs: setup-chromium
     runs-on: ubuntu-latest

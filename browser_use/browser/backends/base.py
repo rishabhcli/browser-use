@@ -42,6 +42,7 @@ class BrowserBackendCapabilities(BaseModel):
 	supports_downloads: bool = True
 	supports_uploads: bool = True
 	supports_cookie_access: bool = True
+	supports_cdp: bool = True
 	accessibility_permission: str = 'unknown'
 	screen_recording_permission: str = 'unknown'
 	issues: list[str] = Field(default_factory=list)
