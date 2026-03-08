@@ -452,6 +452,7 @@ def ensure_server(session: str, browser: str, headed: bool, profile: str | None,
 
 def send_command(session: str, action: str, params: dict) -> dict:
 	"""Send command to server and get response."""
+	long_running = {'run', 'python'}
 	request = {
 		'id': f'r{int(time.time() * 1000000) % 1000000}',
 		'action': action,
@@ -461,7 +462,7 @@ def send_command(session: str, action: str, params: dict) -> dict:
 
 	sock = connect_to_server(session)
 	try:
-		if action in {'run', 'python'}:
+		if action in long_running:
 			sock.settimeout(None)
 
 		# Send request
@@ -470,7 +471,17 @@ def send_command(session: str, action: str, params: dict) -> dict:
 		# Read response
 		data = b''
 		while not data.endswith(b'\n'):
-			chunk = sock.recv(4096)
+			try:
+				chunk = sock.recv(4096)
+			except TimeoutError:
+				return {
+					'id': request['id'],
+					'success': False,
+					'error': (
+						'CLI timed out waiting for server response. '
+						f'Action "{action}" may still be running in session "{session}".'
+					),
+				}
 			if not chunk:
 				break
 			data += chunk

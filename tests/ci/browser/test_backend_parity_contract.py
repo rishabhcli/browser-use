@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import platform
 import socketserver
 import subprocess
@@ -82,12 +83,30 @@ def parity_http_server():
 			/>
 			<div id="value-mirror">seed</div>
 			<div id="text-block" data-live="stale">Initial text block</div>
-			<select id="dropdown" onchange="document.getElementById('selected-value').textContent = this.value">
+			<select
+				id="dropdown"
+				required
+				onchange="
+					document.getElementById('selected-value').textContent = this.value;
+					const continueButton = document.getElementById('continue-target');
+					continueButton.disabled = !this.value;
+					continueButton.setAttribute('aria-disabled', String(!this.value));
+				"
+			>
 				<option value="">Please select</option>
 				<option value="alpha">Alpha</option>
 				<option value="beta">Beta</option>
 			</select>
 			<div id="selected-value"></div>
+			<button
+				id="continue-target"
+				disabled
+				aria-disabled="true"
+				onclick="logEvent('continue'); document.getElementById('continue-status').textContent = 'continued'"
+			>
+				Continue
+			</button>
+			<div id="continue-status"></div>
 			<div id="click-status"></div>
 			<label id="upload-label" for="file-input">Upload file</label>
 			<input
@@ -164,9 +183,22 @@ def _is_contract_test_tab(url: str, run_token: str) -> bool:
 	return parsed.hostname in {'localhost', '127.0.0.1'} and token == run_token
 
 
-async def _open_safari_test_window(session: BrowserSession) -> int:
+async def _open_safari_test_window(session: BrowserSession) -> tuple[int, bool]:
 	backend = cast(SafariRealProfileBackend, session._backend)
 	assert backend is not None
+	get_window_ids = """
+		(() => {
+			const safari = Application("Safari");
+			const ids = Array.from(safari.windows() || []).filter(Boolean).map(w => w.id());
+			return JSON.stringify(ids);
+		})()
+	"""
+	before_window_ids = {
+		int(w)
+		for w in (
+			await backend._run_jxa_json(get_window_ids) if isinstance(await backend._run_jxa_json(get_window_ids), list) else []
+		)
+	}
 	applescript = """
 	tell application "Safari" to activate
 	tell application "System Events"
@@ -182,9 +214,51 @@ async def _open_safari_test_window(session: BrowserSession) -> int:
 		text=True,
 		check=True,
 	)
-	window = await backend._get_front_window()
+	candidate_window_id: int | None = None
+	created_new_window = False
+	for _ in range(6):
+		after_window_ids = await backend._run_jxa_json(get_window_ids)
+		candidates = [int(w) for w in after_window_ids] if isinstance(after_window_ids, list) else []
+		new_window_ids = [window_id for window_id in candidates if window_id not in before_window_ids]
+		if new_window_ids:
+			candidate_window_id = int(new_window_ids[0])
+			created_new_window = True
+			break
+		await asyncio.sleep(0.2)
+
+	if candidate_window_id is None:
+		window = await backend._get_front_window()
+		candidate_window_id = int(window['windowId'])
+
+	window = await backend._run_jxa_json(
+		f"""
+		const safari = Application(\"Safari\");
+		const targetWindowId = {json.dumps(candidate_window_id)};
+		const windows = Array.from(safari.windows() || []).filter(Boolean);
+		const win = windows.find(w => w.id() === targetWindowId);
+		if (!win) {{
+			JSON.stringify({{}});
+		}} else {{
+			const tabs = Array.from(win.tabs() || []).filter(Boolean);
+			const tab = win.currentTab() || tabs[0] || null;
+			JSON.stringify({{
+				windowId: win.id(),
+				currentTabIndex: tab ? tab.index() : 1,
+			}});
+		}}
+		"""
+	)
+	if not isinstance(window, dict) or not window:
+		window = await backend._get_front_window()
+	else:
+		window = {
+			'windowId': int(window.get('windowId', 0)),
+			'currentTabIndex': int(window.get('currentTabIndex', 1)),
+		}
 	session.agent_focus_target_id = f'safari:{int(window["windowId"])}:{int(window["currentTabIndex"])}'
-	return int(window['windowId'])
+	if hasattr(backend, '_preferred_window_id'):
+		backend._preferred_window_id = int(window['windowId'])
+	return int(window['windowId']), created_new_window
 
 
 async def _close_safari_window(session: BrowserSession, window_id: int) -> None:
@@ -229,6 +303,7 @@ async def contract_harness(
 ):
 	backend = request.param
 	safari_window_id: int | None = None
+	safari_window_created = False
 	if backend == 'safari':
 		reason = _is_safari_available()
 		if reason is not None:
@@ -252,7 +327,7 @@ async def contract_harness(
 		if backend == 'safari':
 			if capabilities.accessibility_permission != 'granted':
 				pytest.skip('Safari live parity tests require Accessibility permission to open an isolated test window.')
-			safari_window_id = await _open_safari_test_window(session)
+			safari_window_id, safari_window_created = await _open_safari_test_window(session)
 			await session.navigate_to(parity_home_url, new_tab=False)
 		else:
 			await session.navigate_to(parity_home_url)
@@ -261,7 +336,7 @@ async def contract_harness(
 	finally:
 		if backend == 'safari':
 			try:
-				if safari_window_id is not None:
+				if safari_window_id is not None and safari_window_created:
 					try:
 						await _close_safari_window(session, safari_window_id)
 					except Exception:
@@ -412,6 +487,40 @@ async def test_backend_parity_tool_navigation_and_dropdown_smoke(
 		'Alpha': 'alpha',
 		'Beta': 'beta',
 	}
+
+
+@pytest.mark.asyncio
+async def test_backend_parity_required_select_unlocks_primary_cta(contract_harness: ContractHarness):
+	session = contract_harness.session
+	tools = Tools()
+
+	dropdown_index, dropdown_node = await _get_node_by_id(session, 'dropdown')
+	continue_index, continue_node = await _get_node_by_id(session, 'continue-target')
+
+	initial_attrs = await session.get_element_attributes(continue_node)
+	assert initial_attrs.get('disabled') in {'', 'true', True, 'disabled'}
+
+	# Clicking a disabled CTA must not silently advance the page state.
+	disabled_click_result = await tools.click(index=continue_index, browser_session=session)
+	await _settle(contract_harness)
+	assert await session.execute_javascript("document.getElementById('continue-status').textContent") == ''
+	if contract_harness.backend == 'safari':
+		assert disabled_click_result.error is not None
+		assert 'Cannot click disabled element' in disabled_click_result.error
+
+	fresh_dropdown_index, _ = await _get_node_by_id(session, 'dropdown')
+	await tools.select_dropdown(index=fresh_dropdown_index, text='Alpha', browser_session=session)
+	await _settle(contract_harness)
+	assert await session.execute_javascript("document.getElementById('selected-value').textContent") == 'alpha'
+
+	fresh_continue_index, fresh_continue_node = await _get_node_by_id(session, 'continue-target')
+	refreshed_attrs = await session.get_element_attributes(fresh_continue_node)
+	assert refreshed_attrs.get('disabled') in {None, '', False}
+
+	enabled_click_result = await tools.click(index=fresh_continue_index, browser_session=session)
+	assert enabled_click_result.error is None
+	await _settle(contract_harness)
+	assert await session.execute_javascript("document.getElementById('continue-status').textContent") == 'continued'
 
 
 @pytest.mark.asyncio

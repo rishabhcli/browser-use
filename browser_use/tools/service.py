@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import anyio
 
@@ -498,6 +498,31 @@ class Tools(Generic[Context]):
 			return llm_x, llm_y
 
 		# Element Interaction Actions
+		def _format_click_validation_error(click_metadata: dict[str, Any]) -> str:
+			"""Turn backend click validation metadata into an actionable agent-facing error."""
+			error_msg = str(click_metadata.get('validation_error') or 'Element could not be clicked.')
+			unresolved_controls = click_metadata.get('unresolvedControls')
+			if not isinstance(unresolved_controls, list) or not unresolved_controls:
+				return error_msg
+
+			control_descriptions: list[str] = []
+			for control in unresolved_controls[:3]:
+				if not isinstance(control, dict):
+					continue
+				label = str(control.get('label') or control.get('tag') or 'control').strip()
+				control_type = str(control.get('type') or control.get('tag') or 'field').strip()
+				selected_text = str(control.get('selectedText') or '').strip()
+				value = str(control.get('value') or '').strip()
+				current_state = selected_text or value
+				if current_state:
+					control_descriptions.append(f'{label} ({control_type}, current={json.dumps(current_state)})')
+				else:
+					control_descriptions.append(f'{label} ({control_type})')
+
+			if not control_descriptions:
+				return error_msg
+			return error_msg + ' Resolve likely blocking controls first: ' + '; '.join(control_descriptions)
+
 		async def _detect_new_tab_opened(
 			browser_session: BrowserSession,
 			tabs_before: set[str],
@@ -546,7 +571,7 @@ class Tools(Generic[Context]):
 
 				# Check for validation errors (only happens when force=False)
 				if isinstance(click_metadata, dict) and 'validation_error' in click_metadata:
-					error_msg = click_metadata['validation_error']
+					error_msg = _format_click_validation_error(click_metadata)
 					return ActionResult(error=error_msg)
 
 				memory = f'Clicked on coordinate {params.coordinate_x}, {params.coordinate_y}'
@@ -597,7 +622,7 @@ class Tools(Generic[Context]):
 
 				# Check if result contains validation error (e.g., trying to click <select> or file input)
 				if isinstance(click_metadata, dict) and 'validation_error' in click_metadata:
-					error_msg = click_metadata['validation_error']
+					error_msg = _format_click_validation_error(click_metadata)
 					# If it's a select element, try to get dropdown options as a helpful shortcut
 					if 'Cannot click on <select> elements.' in error_msg:
 						try:
@@ -833,14 +858,11 @@ class Tools(Generic[Context]):
 					f'No file upload element found near index {params.index}, searching for closest file input to scroll position'
 				)
 
-				# Get current scroll position
-				cdp_session = await browser_session.get_or_create_cdp_session()
 				try:
-					scroll_info = await cdp_session.cdp_client.send.Runtime.evaluate(
-						params={'expression': 'window.scrollY || window.pageYOffset || 0'}, session_id=cdp_session.session_id
-					)
-					current_scroll_y = scroll_info.get('result', {}).get('value', 0)
-				except Exception:
+					state = await browser_session.get_browser_state_summary(include_screenshot=False, cached=False)
+					current_scroll_y = int(state.page_info.scroll_y) if state.page_info else 0
+				except Exception as e:
+					logger.debug(f'Failed to get scroll position from browser state: {type(e).__name__}: {e}')
 					current_scroll_y = 0
 
 				# Find all file inputs in the selector map and pick the closest one to scroll position
@@ -1163,6 +1185,26 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 		# --- Page search and exploration tools (zero LLM cost) ---
 
+		async def _get_viewport_height(browser_session: BrowserSession) -> int:
+			"""Resolve viewport height through the shared browser state contract."""
+			try:
+				state = await browser_session.get_browser_state_summary(include_screenshot=False, cached=False)
+				if state.page_info and state.page_info.viewport_height > 0:
+					return int(state.page_info.viewport_height)
+			except Exception as e:
+				logger.debug(f'Failed to get viewport height from browser state: {type(e).__name__}: {e}')
+			return 1000
+
+		async def _get_scroll_y(browser_session: BrowserSession) -> int:
+			"""Resolve current scroll position through the shared browser state contract."""
+			try:
+				state = await browser_session.get_browser_state_summary(include_screenshot=False, cached=False)
+				if state.page_info:
+					return int(state.page_info.scroll_y)
+			except Exception as e:
+				logger.debug(f'Failed to get scroll position from browser state: {type(e).__name__}: {e}')
+			return 0
+
 		@self.registry.action(
 			"""Search page text for a pattern (like grep). Zero LLM cost, instant. Returns matches with surrounding context. Use to find specific text, verify content exists, or locate data on the page. Set regex=True for regex patterns. Use css_scope to search within a specific section.""",
 			param_model=SearchPageAction,
@@ -1177,17 +1219,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				max_results=params.max_results,
 			)
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-			result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
-				session_id=cdp_session.session_id,
-			)
-
-			if result.get('exceptionDetails'):
-				error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
-				return ActionResult(error=f'search_page failed: {error_text}')
-
-			data = result.get('result', {}).get('value')
+			data = await browser_session.evaluate_javascript(js_code)
 			if data is None:
 				return ActionResult(error='search_page returned no result')
 
@@ -1212,17 +1244,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				include_text=params.include_text,
 			)
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-			result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
-				session_id=cdp_session.session_id,
-			)
-
-			if result.get('exceptionDetails'):
-				error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
-				return ActionResult(error=f'find_elements failed: {error_text}')
-
-			data = result.get('result', {}).get('value')
+			data = await browser_session.evaluate_javascript(js_code)
 			if data is None:
 				return ActionResult(error='find_elements returned no result')
 
@@ -1254,22 +1276,9 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				direction = 'down' if params.down else 'up'
 				target = f'element {params.index}' if params.index is not None and params.index != 0 else ''
 
-				# Get actual viewport height for more accurate scrolling
-				try:
-					cdp_session = await browser_session.get_or_create_cdp_session()
-					metrics = await cdp_session.cdp_client.send.Page.getLayoutMetrics(session_id=cdp_session.session_id)
-
-					# Use cssVisualViewport for the most accurate representation
-					css_viewport = metrics.get('cssVisualViewport', {})
-					css_layout_viewport = metrics.get('cssLayoutViewport', {})
-
-					# Get viewport height, prioritizing cssVisualViewport
-					viewport_height = int(css_viewport.get('clientHeight') or css_layout_viewport.get('clientHeight', 1000))
-
-					logger.debug(f'Detected viewport height: {viewport_height}px')
-				except Exception as e:
-					viewport_height = 1000  # Fallback to 1000px
-					logger.debug(f'Failed to get viewport height, using fallback 1000px: {e}')
+				# Get actual viewport height through the shared backend/session abstraction.
+				viewport_height = await _get_viewport_height(browser_session)
+				logger.debug(f'Detected viewport height: {viewport_height}px')
 
 				# For multiple pages (>=1.0), scroll one page at a time to ensure each scroll completes
 				if params.pages >= 1.0:
@@ -1433,6 +1442,11 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			"""Save the current page as a PDF using CDP Page.printToPDF."""
 			import base64
 			import re
+
+			if not browser_session.get_backend_capabilities().supports_cdp:
+				return ActionResult(
+					error='save_as_pdf is not supported with the Safari real-profile backend. Use screenshot or extract page content instead.'
+				)
 
 			# Paper format dimensions in inches (width, height)
 			paper_sizes: dict[str, tuple[float, float]] = {
@@ -1935,50 +1949,16 @@ Context: {context}"""
 		async def evaluate(code: str, browser_session: BrowserSession):
 			# Execute JavaScript with proper error handling and promise support
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-
 			try:
 				# Validate and potentially fix JavaScript code before execution
 				validated_code = self._validate_and_fix_javascript(code)
 
-				# Always use awaitPromise=True - it's ignored for non-promises
-				result = await cdp_session.cdp_client.send.Runtime.evaluate(
-					params={'expression': validated_code, 'returnByValue': True, 'awaitPromise': True},
-					session_id=cdp_session.session_id,
-				)
-
-				# Check for JavaScript execution errors
-				if result.get('exceptionDetails'):
-					exception = result['exceptionDetails']
-					error_msg = f'JavaScript execution error: {exception.get("text", "Unknown error")}'
-
-					# Enhanced error message with debugging info
-					enhanced_msg = f"""JavaScript Execution Failed:
-{error_msg}
-
-Validated Code (after quote fixing):
-{validated_code[:500]}{'...' if len(validated_code) > 500 else ''}
-"""
-
-					logger.debug(enhanced_msg)
-					return ActionResult(error=enhanced_msg)
-
-				# Get the result data
-				result_data = result.get('result', {})
-
-				# Check for wasThrown flag (backup error detection)
-				if result_data.get('wasThrown'):
-					msg = f'JavaScript code: {code} execution failed (wasThrown=true)'
-					logger.debug(msg)
-					return ActionResult(error=msg)
-
-				# Get the actual value
-				value = result_data.get('value')
+				value = await browser_session.evaluate_javascript(validated_code)
 
 				# Handle different value types
 				if value is None:
 					# Could be legitimate null/undefined result
-					result_text = str(value) if 'value' in result_data else 'undefined'
+					result_text = 'null'
 				elif isinstance(value, (dict, list)):
 					# Complex objects - should be serialized by returnByValue
 					try:
@@ -2647,14 +2627,11 @@ class CodeAgentTools(Tools[Context]):
 					f'No file upload element found near index {params.index}, searching for closest file input to scroll position'
 				)
 
-				# Get current scroll position
-				cdp_session = await browser_session.get_or_create_cdp_session()
 				try:
-					scroll_info = await cdp_session.cdp_client.send.Runtime.evaluate(
-						params={'expression': 'window.scrollY || window.pageYOffset || 0'}, session_id=cdp_session.session_id
-					)
-					current_scroll_y = scroll_info.get('result', {}).get('value', 0)
-				except Exception:
+					state = await browser_session.get_browser_state_summary(include_screenshot=False, cached=False)
+					current_scroll_y = int(state.page_info.scroll_y) if state.page_info else 0
+				except Exception as e:
+					logger.debug(f'Failed to get scroll position from browser state: {type(e).__name__}: {e}')
 					current_scroll_y = 0
 
 				# Find all file inputs in the selector map and pick the closest one to scroll position

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from browser_use.browser.backends.base import BackendCapabilityReport, BrowserBackend
 from browser_use.browser.views import BrowserError, BrowserStateSummary, PageInfo, TabInfo
@@ -200,13 +201,15 @@ class SafariRealProfileBackend(BrowserBackend):
 	def __init__(self, browser_session) -> None:
 		super().__init__(browser_session)
 		self._selector_map: dict[int, EnhancedDOMTreeNode] = {}
+		self._preferred_window_id: int | None = None
 
 	async def start(self) -> BackendCapabilityReport:
 		report = await self._probe_capabilities()
 		if not report.available:
 			raise BrowserError(report.reason or 'Safari backend is unavailable', details=report.details)
 
-		await self._ensure_profile_window()
+		window = await self._ensure_profile_window()
+		self._preferred_window_id = int(window['windowId'])
 		tabs = await self.get_tabs()
 		if tabs:
 			self.browser_session.agent_focus_target_id = tabs[0].target_id
@@ -227,11 +230,12 @@ class SafariRealProfileBackend(BrowserBackend):
 			const safari = Application("Safari");
 			safari.activate();
 			const windowId = {window['windowId']};
-			const win = safari.windows().find(w => w.id() === windowId) || safari.windows()[0];
+			const windows = Array.from(safari.windows() || []).filter(Boolean);
+			const win = windows.find(w => w.id() === windowId) || windows[0];
 			if (!win) {{
 				JSON.stringify([]);
 			}} else {{
-				const tabs = Array.from(win.tabs()).filter(Boolean);
+				const tabs = Array.from(win.tabs() || []).filter(Boolean);
 				const currentTab = win.currentTab();
 				const fallbackTab = tabs[0] || null;
 				const currentIndex = currentTab ? currentTab.index() : (fallbackTab ? fallbackTab.index() : null);
@@ -301,7 +305,8 @@ class SafariRealProfileBackend(BrowserBackend):
 			if (safari.windows().length === 0) {{
 				throw new Error("Safari has no open windows.");
 			}}
-			const win = safari.windows().find(w => w.id() === {window_id}) || safari.windows()[0];
+			const windows = Array.from(safari.windows() || []).filter(Boolean);
+			const win = windows.find(w => w.id() === {window_id}) || windows[0];
 			if ({'true' if new_tab else 'false'}) {{
 				const tab = safari.Tab();
 				win.tabs.push(tab);
@@ -328,8 +333,9 @@ class SafariRealProfileBackend(BrowserBackend):
 			if (safari.windows().length === 0) {{
 				throw new Error("Safari has no open windows.");
 			}}
-			const win = safari.windows().find(w => w.id() === {window_id}) || safari.windows()[0];
-			const tabs = Array.from(win.tabs()).filter(Boolean);
+			const windows = Array.from(safari.windows() || []).filter(Boolean);
+			const win = windows.find(w => w.id() === {window_id}) || windows[0];
+			const tabs = Array.from(win.tabs() || []).filter(Boolean);
 			const tab = tabs.find(t => t.index() === {tab_index}) || win.currentTab() || tabs[0];
 			if (!tab) {{
 				throw new Error("Safari has no initialized tabs.");
@@ -403,6 +409,14 @@ class SafariRealProfileBackend(BrowserBackend):
 	) -> BrowserStateSummary:
 		window = await self._ensure_profile_window()
 		state = await self.evaluate_javascript(self._state_extraction_script())
+		if self._state_needs_recovery(state):
+			self.logger.warning(
+				f'Safari returned a sparse page state for {state.get("url") if isinstance(state, dict) else "unknown URL"}; refreshing once and retrying.'
+			)
+			await self.refresh()
+			recovered_state = await self.evaluate_javascript(self._state_extraction_script())
+			if isinstance(recovered_state, dict):
+				state = recovered_state
 		if not isinstance(state, dict):
 			raise BrowserError('Safari state extraction returned an unexpected payload', details={'payload': state})
 
@@ -447,6 +461,29 @@ class SafariRealProfileBackend(BrowserBackend):
 		)
 		self.browser_session._cached_browser_state_summary = browser_state
 		return browser_state
+
+	def _state_needs_recovery(self, state: Any) -> bool:
+		"""Detect Safari white/blank page states that should trigger a one-time refresh."""
+		if not isinstance(state, dict):
+			return False
+
+		url = str(state.get('url') or '').strip()
+		if not url or url == 'about:blank':
+			return False
+		parsed_url = urlparse(url)
+		if parsed_url.scheme and parsed_url.scheme not in {'http', 'https'}:
+			return False
+
+		title = str(state.get('title') or '').strip()
+		elements = state.get('elements')
+		text_blocks = state.get('textBlocks')
+		if not isinstance(elements, list) or not isinstance(text_blocks, list):
+			return False
+
+		meaningful_text_chars = sum(
+			len(str(block.get('text') or '').strip()) for block in text_blocks[:8] if isinstance(block, dict)
+		)
+		return not title and len(elements) == 0 and meaningful_text_chars == 0
 
 	async def get_element_by_index(self, index: int) -> EnhancedDOMTreeNode | None:
 		return self._selector_map.get(index)
@@ -504,18 +541,21 @@ class SafariRealProfileBackend(BrowserBackend):
 		await self._ensure_profile_window()
 		if target_id is None:
 			tabs = await self.get_tabs()
-			if not tabs:
+			preferred_tab = self.browser_session._pick_safari_recovery_tab(tabs)
+			if preferred_tab is None:
 				raise BrowserError('Safari has no open tabs to focus.')
-			target_id = tabs[-1].target_id
+			target_id = preferred_tab.target_id
 
 		window_id, tab_index = self._parse_target_id(target_id)
+		self._preferred_window_id = window_id
 		await self._run_jxa(
 			f"""
 			const safari = Application("Safari");
 			safari.activate();
-			const win = safari.windows().find(w => w.id() === {window_id});
+			const windows = Array.from(safari.windows() || []).filter(Boolean);
+			const win = windows.find(w => w.id() === {window_id});
 			if (!win) throw new Error("Safari window {window_id} not found");
-			const tab = Array.from(win.tabs()).filter(Boolean).find(t => t.index() === {tab_index});
+			const tab = Array.from(win.tabs() || []).filter(Boolean).find(t => t.index() === {tab_index});
 			if (!tab) throw new Error("Safari tab {tab_index} not found");
 			win.currentTab = tab;
 			"""
@@ -529,14 +569,45 @@ class SafariRealProfileBackend(BrowserBackend):
 			f"""
 			const safari = Application("Safari");
 			safari.activate();
-			const win = safari.windows().find(w => w.id() === {window_id});
+			const windows = Array.from(safari.windows() || []).filter(Boolean);
+			const win = windows.find(w => w.id() === {window_id});
 			if (win) {{
-				const tab = Array.from(win.tabs()).filter(Boolean).find(t => t.index() === {tab_index});
-				if (tab) {{
-					tab.close();
+				const targetIndex = Number({tab_index});
+				const tabs = Array.from(win.tabs() || []).filter(Boolean);
+				const tab = tabs.find(t => t.index() === targetIndex);
+				if (!tab) {{
+					return;
 				}}
+				if (tabs.length <= 1) {{
+					// Safari closes a window when the last tab is closed.
+					// Keep the window alive by neutralizing tab content instead.
+					try {{
+						tab.url = "about:blank";
+					}} catch (error) {{
+						// As a fallback, focus current tab after failed URL update.
+						win.currentTab = tab;
+					}}
+					return;
+				}}
+				const currentTab = win.currentTab();
+				const fallbackTab = tabs.find(t => t.index() !== targetIndex);
+				if (fallbackTab && currentTab && currentTab.index() === targetIndex) {{
+					win.currentTab = fallbackTab;
+				}}
+				try {{
+					tab.close();
+				}} catch (error) {{
+					// If tab close fails, avoid closing the whole window.
+					try {{
+						tab.url = "about:blank";
+					}} catch (fallbackError) {{
+						console.log("Fallback tab neutralize failed", fallbackError);
+					}}
+				}}
+			}} else {{
+				return;
 			}}
-			"""
+		"""
 		)
 		await asyncio.sleep(0.15)
 		await self._refresh_focus_target()
@@ -546,6 +617,7 @@ class SafariRealProfileBackend(BrowserBackend):
 		result = await self.evaluate_javascript(
 			f"""
 			(() => {{
+				const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
 				const el = document.querySelector('[data-browser-use-safari-id="{node.backend_node_id}"]');
 				if (!el) return {{ ok: false, error: 'not_found' }};
 				el.scrollIntoView({{ block: 'center', inline: 'center' }});
@@ -571,6 +643,82 @@ class SafariRealProfileBackend(BrowserBackend):
 				].join(',');
 				let target = hitTarget && el.contains(hitTarget) ? hitTarget : el;
 				target = target.closest(interactiveSelector) || el.closest(interactiveSelector) || target;
+				const describeControl = control => {{
+					const selectedText =
+						control instanceof HTMLSelectElement && control.options && control.selectedIndex >= 0
+							? clean(control.options[control.selectedIndex].innerText || control.options[control.selectedIndex].textContent || '')
+							: '';
+					const explicitLabel =
+						control.labels && control.labels.length
+							? clean(Array.from(control.labels).map(label => label.innerText || label.textContent || '').join(' '))
+							: '';
+					const wrappingLabel =
+						control.closest('label') && control.closest('label') !== control
+							? clean(control.closest('label').innerText || control.closest('label').textContent || '')
+							: '';
+					return {{
+						tag: control.tagName ? control.tagName.toLowerCase() : '',
+						type: (control.getAttribute('type') || '').toLowerCase(),
+						label: clean(
+							explicitLabel ||
+							control.getAttribute('aria-label') ||
+							control.getAttribute('placeholder') ||
+							control.getAttribute('name') ||
+							wrappingLabel
+						),
+						value: 'value' in control && typeof control.value === 'string' ? control.value.slice(0, 120) : '',
+						selectedText,
+					}};
+				}};
+				const unresolvedControls = Array.from(document.querySelectorAll('input,select,textarea,[aria-required="true"]'))
+					.filter(control => {{
+						if (!(control instanceof Element)) return false;
+						if (control === el || control === target) return false;
+						const rect = control.getBoundingClientRect();
+						if (rect.width < 1 || rect.height < 1) return false;
+						const type = (control.getAttribute('type') || '').toLowerCase();
+						if (type === 'hidden') return false;
+						const isDisabled =
+							('disabled' in control && control.disabled) ||
+							control.getAttribute('aria-disabled') === 'true';
+						if (isDisabled) return false;
+						const required =
+							('required' in control && control.required) ||
+							control.getAttribute('aria-required') === 'true' ||
+							type === 'radio' ||
+							type === 'checkbox';
+						if (!required) return false;
+						if (control instanceof HTMLSelectElement) {{
+							const value = String(control.value || '').trim().toLowerCase();
+							return value === '' || value === 'none';
+						}}
+						if (control instanceof HTMLInputElement && (type === 'radio' || type === 'checkbox')) return !control.checked;
+						if ('value' in control) return !String(control.value || '').trim();
+						return false;
+					}})
+					.slice(0, 5)
+					.map(describeControl);
+				const isDisabled = !!(
+					('disabled' in target && target.disabled) ||
+					target.getAttribute('aria-disabled') === 'true'
+				);
+				if (isDisabled) {{
+					const unresolvedSummary = unresolvedControls
+						.map(control => clean(
+							[control.label, control.selectedText, control.value, control.type, control.tag]
+								.filter(Boolean)
+								.join(' ')
+						))
+						.filter(Boolean);
+					return {{
+						validation_error: unresolvedSummary.length
+							? 'Cannot click disabled element. Resolve required controls first: ' + unresolvedSummary.join(', ') + '.'
+							: 'Cannot click disabled element.',
+						targetTag: target.tagName ? target.tagName.toLowerCase() : null,
+						targetId: target.id || null,
+						unresolvedControls,
+					}};
+				}}
 				if (typeof target.focus === 'function') {{
 					target.focus({{ preventScroll: true }});
 				}}
@@ -713,6 +861,7 @@ class SafariRealProfileBackend(BrowserBackend):
 		result = await self.evaluate_javascript(
 			f"""
 			(() => {{
+				const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
 				const el = document.elementFromPoint({x}, {y});
 				if (!el) return {{ ok: false, error: 'not_found' }};
 				const interactiveSelector = [
@@ -732,6 +881,82 @@ class SafariRealProfileBackend(BrowserBackend):
 					'[tabindex]'
 				].join(',');
 				const target = el.closest(interactiveSelector) || el;
+				const describeControl = control => {{
+					const selectedText =
+						control instanceof HTMLSelectElement && control.options && control.selectedIndex >= 0
+							? clean(control.options[control.selectedIndex].innerText || control.options[control.selectedIndex].textContent || '')
+							: '';
+					const explicitLabel =
+						control.labels && control.labels.length
+							? clean(Array.from(control.labels).map(label => label.innerText || label.textContent || '').join(' '))
+							: '';
+					const wrappingLabel =
+						control.closest('label') && control.closest('label') !== control
+							? clean(control.closest('label').innerText || control.closest('label').textContent || '')
+							: '';
+					return {{
+						tag: control.tagName ? control.tagName.toLowerCase() : '',
+						type: (control.getAttribute('type') || '').toLowerCase(),
+						label: clean(
+							explicitLabel ||
+							control.getAttribute('aria-label') ||
+							control.getAttribute('placeholder') ||
+							control.getAttribute('name') ||
+							wrappingLabel
+						),
+						value: 'value' in control && typeof control.value === 'string' ? control.value.slice(0, 120) : '',
+						selectedText,
+					}};
+				}};
+				const unresolvedControls = Array.from(document.querySelectorAll('input,select,textarea,[aria-required="true"]'))
+					.filter(control => {{
+						if (!(control instanceof Element)) return false;
+						if (control === target) return false;
+						const rect = control.getBoundingClientRect();
+						if (rect.width < 1 || rect.height < 1) return false;
+						const type = (control.getAttribute('type') || '').toLowerCase();
+						if (type === 'hidden') return false;
+						const isDisabled =
+							('disabled' in control && control.disabled) ||
+							control.getAttribute('aria-disabled') === 'true';
+						if (isDisabled) return false;
+						const required =
+							('required' in control && control.required) ||
+							control.getAttribute('aria-required') === 'true' ||
+							type === 'radio' ||
+							type === 'checkbox';
+						if (!required) return false;
+						if (control instanceof HTMLSelectElement) {{
+							const value = String(control.value || '').trim().toLowerCase();
+							return value === '' || value === 'none';
+						}}
+						if (control instanceof HTMLInputElement && (type === 'radio' || type === 'checkbox')) return !control.checked;
+						if ('value' in control) return !String(control.value || '').trim();
+						return false;
+					}})
+					.slice(0, 5)
+					.map(describeControl);
+				const isDisabled = !!(
+					('disabled' in target && target.disabled) ||
+					target.getAttribute('aria-disabled') === 'true'
+				);
+				if (isDisabled) {{
+					const unresolvedSummary = unresolvedControls
+						.map(control => clean(
+							[control.label, control.selectedText, control.value, control.type, control.tag]
+								.filter(Boolean)
+								.join(' ')
+						))
+						.filter(Boolean);
+					return {{
+						validation_error: unresolvedSummary.length
+							? 'Cannot click disabled element. Resolve required controls first: ' + unresolvedSummary.join(', ') + '.'
+							: 'Cannot click disabled element.',
+						targetTag: target.tagName ? target.tagName.toLowerCase() : null,
+						targetId: target.id || null,
+						unresolvedControls,
+					}};
+				}}
 				if (typeof target.focus === 'function') {{
 					target.focus({{ preventScroll: true }});
 				}}
@@ -923,19 +1148,56 @@ class SafariRealProfileBackend(BrowserBackend):
 			}})()
 			"""
 		)
+		await asyncio.sleep(0.15)
 		return result if isinstance(result, dict) else {}
 
 	async def scroll_to_text(self, text: str, direction: str = 'down') -> None:
 		result = await self.evaluate_javascript(
 			f"""
 			(() => {{
+				const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
 				const query = {json.dumps(text)}.toLowerCase();
-				const nodes = Array.from(document.querySelectorAll('body *')).filter(el => {{
-					const value = (el.innerText || el.textContent || '').toLowerCase();
-					return value.includes(query);
+				const viewportCenter = window.scrollY + window.innerHeight / 2;
+				const interactiveSelector = 'button,a,label,input,select,textarea,summary,[role="button"],[role="link"],[role="menuitem"],[tabindex]';
+				const candidates = Array.from(document.querySelectorAll('body *'))
+					.map(el => {{
+						const value = clean(el.innerText || el.textContent || '');
+						if (!value) return null;
+						const lowerValue = value.toLowerCase();
+						if (!lowerValue.includes(query)) return null;
+						const rect = el.getBoundingClientRect();
+						if (rect.width < 1 || rect.height < 1) return null;
+						const pageY = rect.top + window.scrollY;
+						const isInteractive = !!(el.matches(interactiveSelector) || el.closest(interactiveSelector));
+						const isHeading = /^H[1-6]$/.test(el.tagName) || el.tagName === 'SUMMARY' || el.tagName === 'LEGEND';
+						const exactStarts = lowerValue.startsWith(query);
+						return {{
+							el,
+							pageY,
+							textLength: value.length,
+							isInteractive,
+							isHeading,
+							exactStarts,
+							directionDistance:
+								{json.dumps(direction)} === 'up'
+									? (pageY <= viewportCenter ? viewportCenter - pageY : Number.POSITIVE_INFINITY)
+									: (pageY >= viewportCenter ? pageY - viewportCenter : Number.POSITIVE_INFINITY),
+						}};
+					}})
+					.filter(Boolean);
+				if (!candidates.length) return false;
+				candidates.sort((a, b) => {{
+					const aHasDirectionalMatch = Number.isFinite(a.directionDistance);
+					const bHasDirectionalMatch = Number.isFinite(b.directionDistance);
+					if (aHasDirectionalMatch !== bHasDirectionalMatch) return aHasDirectionalMatch ? -1 : 1;
+					if (a.directionDistance !== b.directionDistance) return a.directionDistance - b.directionDistance;
+					if (a.isInteractive !== b.isInteractive) return a.isInteractive ? -1 : 1;
+					if (a.isHeading !== b.isHeading) return a.isHeading ? -1 : 1;
+					if (a.exactStarts !== b.exactStarts) return a.exactStarts ? -1 : 1;
+					if (a.textLength !== b.textLength) return a.textLength - b.textLength;
+					return a.pageY - b.pageY;
 				}});
-				if (!nodes.length) return false;
-				const node = {'nodes[nodes.length - 1]' if direction == 'up' else 'nodes[0]'};
+				const node = candidates[0].el;
 				node.scrollIntoView({{ block: 'center' }});
 				return true;
 			}})()
@@ -1023,13 +1285,21 @@ class SafariRealProfileBackend(BrowserBackend):
 				await self._open_profile_window(profile)
 
 		if profile.lower() == 'active':
-			preferred_window_id = self._focused_window_id()
-			if preferred_window_id is not None:
-				preferred_window = await self._get_window_snapshot(preferred_window_id)
+			candidate_window_ids: list[int] = []
+			focused_window_id = self._focused_window_id()
+			if focused_window_id is not None:
+				candidate_window_ids.append(focused_window_id)
+			if self._preferred_window_id is not None:
+				if focused_window_id != self._preferred_window_id:
+					candidate_window_ids.append(self._preferred_window_id)
+			for window_id in candidate_window_ids:
+				preferred_window = await self._get_window_snapshot(window_id)
 				if preferred_window is not None:
+					self._preferred_window_id = int(preferred_window['windowId'])
 					return preferred_window
 
 		window = await self._get_front_window()
+		self._preferred_window_id = int(window['windowId'])
 		if profile.lower() != 'active':
 			window_profile = self._extract_profile_label(str(window.get('windowName') or ''))
 			if window_profile != profile:
@@ -1109,10 +1379,11 @@ class SafariRealProfileBackend(BrowserBackend):
 		return window
 
 	async def _refresh_focus_target(self) -> None:
-		preferred_window_id = self._focused_window_id()
+		preferred_window_id = self._focused_window_id() or self._preferred_window_id
 		window = await self._get_window_snapshot(preferred_window_id) if preferred_window_id is not None else None
 		if window is None:
 			window = await self._get_front_window()
+		self._preferred_window_id = int(window['windowId'])
 		self.browser_session.agent_focus_target_id = self._target_id(
 			int(window['windowId']),
 			int(window['currentTabIndex']),
@@ -1137,13 +1408,14 @@ class SafariRealProfileBackend(BrowserBackend):
 			if (safari.windows().length === 0) {{
 				JSON.stringify({{windowId: 0, windowName: "", currentTabIndex: 1, title: "", url: "about:blank"}});
 			}} else {{
+				const windows = Array.from(safari.windows() || []).filter(Boolean);
 				const win = targetWindowId === null
-					? safari.windows()[0]
-					: safari.windows().find(w => w.id() === targetWindowId);
+					? windows[0]
+					: windows.find(w => w.id() === targetWindowId);
 				if (!win) {{
 					JSON.stringify(null);
 				}} else {{
-					const tabs = Array.from(win.tabs()).filter(Boolean);
+					const tabs = Array.from(win.tabs() || []).filter(Boolean);
 					const tab = win.currentTab() || tabs[0] || null;
 					if (!tab) {{
 						JSON.stringify({{
@@ -1379,14 +1651,48 @@ class SafariRealProfileBackend(BrowserBackend):
 				const rect = el.getBoundingClientRect();
 				return rect.width >= 1 && rect.height >= 1 && rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
 			};
+			const contextualLabelFor = el => {
+				const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean);
+				if (labelledBy.length) {
+					const text = clean(labelledBy.map(id => {
+						const labelEl = document.getElementById(id);
+						return labelEl ? (labelEl.innerText || labelEl.textContent || '') : '';
+					}).join(' '));
+					if (text) return text;
+				}
+				const wrappingLabel = el.closest('label');
+				if (wrappingLabel && wrappingLabel !== el) {
+					const text = clean(wrappingLabel.innerText || wrappingLabel.textContent || '');
+					if (text) return text;
+				}
+				const fieldContainer = el.closest('.form-dropdown, .form-selector-group, .rc-dimension-selector-group, fieldset');
+				if (!fieldContainer) return '';
+				const heading = fieldContainer.querySelector(
+					'legend, .rs-mac-bfe-step-header, .form-selector-title, .form-dropdown, h1, h2, h3, h4, h5, h6'
+				);
+				return heading ? clean(heading.innerText || heading.textContent || '') : '';
+			};
 			const labelFor = el => {
 				if (el.labels && el.labels.length) {
 					return clean(Array.from(el.labels).map(label => label.innerText || label.textContent || '').join(' '));
 				}
-				return clean(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || '');
+				return clean(
+					el.getAttribute('aria-label') ||
+					el.getAttribute('placeholder') ||
+					el.getAttribute('name') ||
+					contextualLabelFor(el)
+				);
+			};
+			const selectValueText = el => {
+				if (!(el instanceof HTMLSelectElement)) return '';
+				const selectedOption = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+				return clean(selectedOption ? (selectedOption.innerText || selectedOption.textContent || '') : '');
 			};
 			const textFor = el => {
-				if (el.matches('input, textarea, select')) {
+				if (el.matches('select')) {
+					return clean([labelFor(el), selectValueText(el), el.value || ''].filter(Boolean).join(' '));
+				}
+				if (el.matches('input, textarea')) {
 					return clean(labelFor(el) || el.value || '');
 				}
 				return clean(el.innerText || el.textContent || labelFor(el));
@@ -1396,6 +1702,7 @@ class SafariRealProfileBackend(BrowserBackend):
 				'a[href]',
 				'button',
 				'input',
+				'label',
 				'select',
 				'textarea',
 				'summary',
@@ -1414,6 +1721,7 @@ class SafariRealProfileBackend(BrowserBackend):
 			const seen = new Set();
 			for (const el of document.querySelectorAll(selector)) {
 				if (elements.length >= 160) break;
+				if (el.tagName === 'LABEL' && !el.control && !el.querySelector('input,select,textarea')) continue;
 				if (!isVisible(el)) continue;
 				const rect = el.getBoundingClientRect();
 				const fingerprint = `${el.tagName}:${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${clean((el.innerText || el.textContent || '').slice(0, 80))}`;
@@ -1436,10 +1744,16 @@ class SafariRealProfileBackend(BrowserBackend):
 						type: el.getAttribute('type') || '',
 						placeholder: el.getAttribute('placeholder') || '',
 						value: ('value' in el && typeof el.value === 'string') ? el.value.slice(0, 200) : '',
+						'selected-text': el.matches('select') ? selectValueText(el).slice(0, 200) : '',
 						title: el.getAttribute('title') || '',
 						role: el.getAttribute('role') || '',
 						href: el.getAttribute('href') || '',
 						'aria-label': el.getAttribute('aria-label') || '',
+						'aria-disabled': el.getAttribute('aria-disabled') || '',
+						'aria-checked': el.getAttribute('aria-checked') || '',
+						disabled: ('disabled' in el && el.disabled) ? 'true' : '',
+						required: ('required' in el && el.required) ? 'true' : '',
+						checked: ('checked' in el && el.checked) ? 'true' : '',
 					},
 				});
 			}

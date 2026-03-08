@@ -47,7 +47,7 @@ from browser_use.browser.events import (
 	TabCreatedEvent,
 )
 from browser_use.browser.profile import BrowserProfile, ProxySettings
-from browser_use.browser.views import BrowserError, BrowserStateSummary, PageInfo, TabInfo
+from browser_use.browser.views import PLACEHOLDER_4PX_SCREENSHOT, BrowserError, BrowserStateSummary, PageInfo, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
 from browser_use.observability import observe_debug
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
@@ -1647,7 +1647,9 @@ class BrowserSession(BaseModel):
 		if self.is_safari_backend:
 			assert self._backend is not None
 			if cached and self._cached_browser_state_summary is not None and self._cached_browser_state_summary.dom_state:
-				if include_screenshot and not self._cached_browser_state_summary.screenshot:
+				if self._is_sparse_safari_state(self._cached_browser_state_summary):
+					self.logger.debug('⚠️ Cached Safari state looks sparse, fetching fresh state')
+				elif include_screenshot and not self._cached_browser_state_summary.screenshot:
 					self.logger.debug('⚠️ Cached Safari state has no screenshot, fetching fresh state')
 				else:
 					return self._cached_browser_state_summary
@@ -1656,6 +1658,18 @@ class BrowserSession(BaseModel):
 				include_screenshot=include_screenshot,
 				include_recent_events=include_recent_events,
 			)
+			if self._is_sparse_safari_state(result):
+				self.logger.warning(
+					f'⚠️ Sparse Safari state detected for {_log_pretty_url(result.url)}; refreshing once before returning state'
+				)
+				try:
+					await self._require_safari_backend().refresh()
+					result = await self._backend.get_browser_state_summary(
+						include_screenshot=include_screenshot,
+						include_recent_events=include_recent_events,
+					)
+				except Exception as exc:
+					self.logger.warning(f'Failed to recover sparse Safari state via refresh: {type(exc).__name__}: {exc}')
 			self._cached_browser_state_summary = result
 			return result
 
@@ -2678,6 +2692,118 @@ class BrowserSession(BaseModel):
 		"""Backward-compatible alias for get_tabs()."""
 		return await self.get_tabs()
 
+	def _parse_safari_target_coordinates(self, target_id: str) -> tuple[int, int] | None:
+		"""Parse ``safari:<window>:<tab>`` target ids for ranking Safari tab candidates."""
+		parts = target_id.split(':')
+		if len(parts) != 3 or parts[0] != 'safari':
+			return None
+		try:
+			return int(parts[1]), int(parts[2])
+		except ValueError:
+			return None
+
+	def _is_low_priority_safari_tab(self, tab: TabInfo) -> bool:
+		"""Return whether a Safari tab looks like a support/help popup rather than the main task tab."""
+		title = (tab.title or '').lower()
+		url = (tab.url or '').lower()
+		popup_markers = (
+			'/support',
+			'/help',
+			'/faq',
+			'/contact',
+			'/chat',
+			'getsupport.apple.com',
+			'support.apple.com',
+			'help.',
+			'contact us',
+			'need help',
+			'shipping help',
+			'delivery help',
+		)
+		return any(marker in title or marker in url for marker in popup_markers)
+
+	def _resolve_ambiguous_safari_tab_reference(self, tab_id: str, candidates: list[TabInfo]) -> TargetID | None:
+		"""Prefer same-window non-popup Safari tabs when a short tab id matches multiple targets."""
+		if len(candidates) <= 1:
+			return candidates[0].target_id if candidates else None
+
+		current_coords = (
+			self._parse_safari_target_coordinates(self.agent_focus_target_id)
+			if isinstance(self.agent_focus_target_id, str)
+			else None
+		)
+
+		def score(tab: TabInfo) -> tuple[int, int, int, str]:
+			coords = self._parse_safari_target_coordinates(tab.target_id)
+			same_window = int(bool(current_coords and coords and coords[0] == current_coords[0]))
+			not_popup = int(not self._is_low_priority_safari_tab(tab))
+			not_blank = int(tab.url != 'about:blank')
+			return (not_popup, same_window, not_blank, tab.target_id)
+
+		ranked = sorted(candidates, key=score, reverse=True)
+		if len(ranked) == 1:
+			return ranked[0].target_id
+
+		best = score(ranked[0])
+		second = score(ranked[1])
+		if best[:3] != second[:3]:
+			self.logger.debug(
+				f'Resolved ambiguous Safari tab reference ...{tab_id} to {ranked[0].target_id} using same-window/non-popup ranking'
+			)
+			return ranked[0].target_id
+		return None
+
+	def _pick_safari_recovery_tab(self, tabs: list[TabInfo]) -> TabInfo | None:
+		"""Choose the best Safari tab to keep focus on after popup/help-tab contamination."""
+		if not tabs:
+			return None
+
+		current_coords = (
+			self._parse_safari_target_coordinates(self.agent_focus_target_id)
+			if isinstance(self.agent_focus_target_id, str)
+			else None
+		)
+
+		def score(tab: TabInfo) -> tuple[int, int, int, int, int, int, str]:
+			coords = self._parse_safari_target_coordinates(tab.target_id)
+			is_current = int(tab.target_id == self.agent_focus_target_id and not self._is_low_priority_safari_tab(tab))
+			not_popup = int(not self._is_low_priority_safari_tab(tab))
+			same_window = int(bool(current_coords and coords and coords[0] == current_coords[0]))
+			not_blank = int(tab.url != 'about:blank')
+			is_http = int(tab.url.startswith(('http://', 'https://')))
+			has_title = int(bool(tab.title.strip()))
+			return (is_current, not_popup, same_window, not_blank, is_http, has_title, tab.target_id)
+
+		return max(tabs, key=score)
+
+	def _is_sparse_safari_state(self, state: BrowserStateSummary) -> bool:
+		"""Detect Safari white/blank-page glitches that need one refresh before agent reasoning."""
+		if not self.is_safari_backend:
+			return False
+		if state.url in {'', 'about:blank'}:
+			return False
+		parsed_url = urlparse(state.url)
+		if parsed_url.scheme and parsed_url.scheme not in {'http', 'https'}:
+			return False
+
+		selector_map = getattr(state.dom_state, 'selector_map', {}) or {}
+		try:
+			dom_text = ' '.join(str(state.dom_state.llm_representation()).split())
+		except Exception:
+			dom_text = ''
+
+		interactive_count = len(selector_map)
+		has_title = bool(state.title.strip())
+		has_non_placeholder_screenshot = bool(state.screenshot and state.screenshot != PLACEHOLDER_4PX_SCREENSHOT)
+		page_info = state.page_info
+		if page_info and (page_info.viewport_width <= 0 or page_info.viewport_height <= 0):
+			return True
+		if interactive_count > 1 or len(dom_text) >= 120:
+			return False
+		if not has_title and len(dom_text) < 80 and not has_non_placeholder_screenshot:
+			return True
+		return interactive_count == 0 and not has_title and len(dom_text) < 40
+
 	async def _resolve_tab_reference(self, tab: int | str) -> TargetID:
 		"""Resolve an index or tab id suffix/full id to a TargetID."""
 		if isinstance(tab, int):
@@ -3141,6 +3267,10 @@ class BrowserSession(BaseModel):
 		if not normalized_tab_id:
 			raise ValueError('tab_id cannot be empty')
 
+		if self.session_manager and normalized_tab_id in self.session_manager.get_all_target_ids():
+			if await self.session_manager.is_target_valid(normalized_tab_id):
+				return normalized_tab_id
+
 		if self.session_manager:
 			for full_target_id in self.session_manager.get_all_target_ids():
 				if full_target_id.endswith(normalized_tab_id):
@@ -3151,10 +3281,25 @@ class BrowserSession(BaseModel):
 					self.logger.debug(f'Found stale target {full_target_id}, skipping')
 
 		tabs = await self.get_tabs()
+		exact_tab = next((tab.target_id for tab in tabs if tab.target_id == normalized_tab_id), None)
+		if exact_tab is not None:
+			return exact_tab
+
 		matching_tabs = [tab.target_id for tab in tabs if tab.target_id.endswith(normalized_tab_id)]
 		if len(matching_tabs) == 1:
 			return matching_tabs[0]
 		if len(matching_tabs) > 1:
+			if self.is_safari_backend:
+				candidates = [tab for tab in tabs if tab.target_id.endswith(normalized_tab_id)]
+				resolved = self._resolve_ambiguous_safari_tab_reference(normalized_tab_id, candidates)
+				if resolved is not None:
+					return resolved
+				preferred = self._pick_safari_recovery_tab(candidates)
+				if preferred is not None:
+					self.logger.debug(
+						f'Resolved ambiguous Safari tab reference {normalized_tab_id!r} to {preferred.target_id} using recovery ranking'
+					)
+					return preferred.target_id
 			raise ValueError(f'Ambiguous tab_id=...{normalized_tab_id}; matches {len(matching_tabs)} open tabs')
 
 		if normalized_tab_id.isdigit():
@@ -3251,10 +3396,20 @@ class BrowserSession(BaseModel):
 		Returns:
 			Index of the element, or None if not found
 		"""
-		selector_map = await self.get_selector_map()
-		for idx, element in selector_map.items():
-			if element.attributes and element.attributes.get('id') == element_id:
-				return idx
+		max_attempts = 2 if self.is_safari_backend else 1
+		for attempt in range(max_attempts):
+			selector_map = await self.get_selector_map()
+			for idx, element in selector_map.items():
+				if element.attributes and element.attributes.get('id') == element_id:
+					return idx
+
+			# Safari extraction can return a transiently sparse selector_map while the page is settling.
+			# Refresh once to force a fresh DOM snapshot before giving up.
+			if self.is_safari_backend and attempt == 0:
+				self.logger.debug(
+					f'Safari selector map did not include id={element_id!r} on attempt 1; refreshing state summary and retrying.'
+				)
+				await self.get_browser_state_summary(include_screenshot=False, cached=False)
 		return None
 
 	async def get_index_by_class(self, class_name: str) -> int | None:

@@ -172,7 +172,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		generate_gif: bool | str = False,
 		available_file_paths: list[str] | None = None,
 		include_attributes: list[str] | None = None,
-		max_actions_per_step: int = 5,
+		max_actions_per_step: int | None = None,
 		use_thinking: bool = True,
 		flash_mode: bool = False,
 		demo_mode: bool | None = None,
@@ -299,6 +299,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.warning(
 				'Demo mode is enabled but the browser is headless=True; set headless=False to view the in-browser panel.'
 			)
+
+		if max_actions_per_step is None:
+			max_actions_per_step = 1 if self.browser_session.is_safari_backend else 5
+			if self.browser_session.is_safari_backend:
+				self.logger.info(
+					'Safari backend detected; defaulting max_actions_per_step=1 to avoid stale element indices on dynamic pages.'
+				)
 
 		# Initialize available file paths as direct attribute
 		self.available_file_paths = available_file_paths

@@ -66,6 +66,34 @@ def test_send_command_disables_socket_timeout_for_long_running_actions(monkeypat
 	assert fake_socket.timeout_values == [None]
 
 
+def test_send_command_returns_helpful_error_on_socket_timeout(monkeypatch):
+	"""Non-response timeouts should be surfaced as a user-level command error."""
+
+	class _FakeSocket:
+		def __init__(self):
+			self.timeout_values: list[float | None] = []
+
+		def settimeout(self, value):
+			self.timeout_values.append(value)
+
+		def sendall(self, data):
+			return None
+
+		def recv(self, size):
+			raise TimeoutError
+
+		def close(self):
+			return None
+
+	fake_socket = _FakeSocket()
+	monkeypatch.setattr(cli_main, 'connect_to_server', lambda session: fake_socket)
+
+	response = cli_main.send_command('default', 'open', {'url': 'https://example.com'})
+
+	assert response['success'] is False
+	assert 'timed out waiting for server response' in response['error']
+
+
 def test_get_session_metadata_path():
 	"""Test that metadata path is generated correctly."""
 	path = get_session_metadata_path('default')

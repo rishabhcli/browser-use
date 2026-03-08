@@ -128,7 +128,9 @@ class SafariWatchdog(BaseWatchdog):
 		await self.event_bus.dispatch(TabClosedEvent(target_id=cast(str, event.target_id)))
 		tabs = await self._backend().get_tabs()
 		if tabs:
-			current = next((tab for tab in tabs if tab.target_id == self.browser_session.agent_focus_target_id), tabs[0])
+			current = next((tab for tab in tabs if tab.target_id == self.browser_session.agent_focus_target_id), None)
+			if current is None or self.browser_session._is_low_priority_safari_tab(current):
+				current = self.browser_session._pick_safari_recovery_tab(tabs) or tabs[0]
 			await self.event_bus.dispatch(AgentFocusChangedEvent(target_id=current.target_id, url=current.url))
 		else:
 			self.browser_session.agent_focus_target_id = None
