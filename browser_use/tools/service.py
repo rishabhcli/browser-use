@@ -905,13 +905,21 @@ class Tools(Generic[Context]):
 					f'No file upload element found near index {params.index}, searching for closest file input to scroll position'
 				)
 
-				# Get current scroll position
-				cdp_session = await browser_session.get_or_create_cdp_session()
 				try:
-					scroll_info = await cdp_session.cdp_client.send.Runtime.evaluate(
-						params={'expression': 'window.scrollY || window.pageYOffset || 0'}, session_id=cdp_session.session_id
-					)
-					current_scroll_y = scroll_info.get('result', {}).get('value', 0)
+					if browser_session.is_safari:
+						current_scroll_y = (
+							await browser_session.require_browser_backend().evaluate(
+								'window.scrollY || window.pageYOffset || 0',
+								await_promise=False,
+							)
+							or 0
+						)
+					else:
+						cdp_session = await browser_session.get_or_create_cdp_session()
+						scroll_info = await cdp_session.cdp_client.send.Runtime.evaluate(
+							params={'expression': 'window.scrollY || window.pageYOffset || 0'}, session_id=cdp_session.session_id
+						)
+						current_scroll_y = scroll_info.get('result', {}).get('value', 0)
 				except Exception:
 					current_scroll_y = 0
 
@@ -1271,17 +1279,20 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				max_results=params.max_results,
 			)
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-			result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
-				session_id=cdp_session.session_id,
-			)
+			if browser_session.is_safari:
+				data = await browser_session.require_browser_backend().evaluate(js_code, await_promise=True)
+			else:
+				cdp_session = await browser_session.get_or_create_cdp_session()
+				result = await cdp_session.cdp_client.send.Runtime.evaluate(
+					params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
+					session_id=cdp_session.session_id,
+				)
 
-			if result.get('exceptionDetails'):
-				error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
-				return ActionResult(error=f'search_page failed: {error_text}')
+				if result.get('exceptionDetails'):
+					error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
+					return ActionResult(error=f'search_page failed: {error_text}')
 
-			data = result.get('result', {}).get('value')
+				data = result.get('result', {}).get('value')
 			if data is None:
 				return ActionResult(error='search_page returned no result')
 
@@ -1306,17 +1317,20 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				include_text=params.include_text,
 			)
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-			result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
-				session_id=cdp_session.session_id,
-			)
+			if browser_session.is_safari:
+				data = await browser_session.require_browser_backend().evaluate(js_code, await_promise=True)
+			else:
+				cdp_session = await browser_session.get_or_create_cdp_session()
+				result = await cdp_session.cdp_client.send.Runtime.evaluate(
+					params={'expression': js_code, 'returnByValue': True, 'awaitPromise': True},
+					session_id=cdp_session.session_id,
+				)
 
-			if result.get('exceptionDetails'):
-				error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
-				return ActionResult(error=f'find_elements failed: {error_text}')
+				if result.get('exceptionDetails'):
+					error_text = result['exceptionDetails'].get('text', 'Unknown JS error')
+					return ActionResult(error=f'find_elements failed: {error_text}')
 
-			data = result.get('result', {}).get('value')
+				data = result.get('result', {}).get('value')
 			if data is None:
 				return ActionResult(error='find_elements returned no result')
 
@@ -1350,15 +1364,24 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 				# Get actual viewport height for more accurate scrolling
 				try:
-					cdp_session = await browser_session.get_or_create_cdp_session()
-					metrics = await cdp_session.cdp_client.send.Page.getLayoutMetrics(session_id=cdp_session.session_id)
+					if browser_session.is_safari:
+						viewport_height = int(
+							await browser_session.require_browser_backend().evaluate(
+								'window.innerHeight || document.documentElement.clientHeight || 1000',
+								await_promise=False,
+							)
+							or 1000
+						)
+					else:
+						cdp_session = await browser_session.get_or_create_cdp_session()
+						metrics = await cdp_session.cdp_client.send.Page.getLayoutMetrics(session_id=cdp_session.session_id)
 
-					# Use cssVisualViewport for the most accurate representation
-					css_viewport = metrics.get('cssVisualViewport', {})
-					css_layout_viewport = metrics.get('cssLayoutViewport', {})
+						# Use cssVisualViewport for the most accurate representation
+						css_viewport = metrics.get('cssVisualViewport', {})
+						css_layout_viewport = metrics.get('cssLayoutViewport', {})
 
-					# Get viewport height, prioritizing cssVisualViewport
-					viewport_height = int(css_viewport.get('clientHeight') or css_layout_viewport.get('clientHeight', 1000))
+						# Get viewport height, prioritizing cssVisualViewport
+						viewport_height = int(css_viewport.get('clientHeight') or css_layout_viewport.get('clientHeight', 1000))
 
 					logger.debug(f'Detected viewport height: {viewport_height}px')
 				except Exception as e:
@@ -1542,27 +1565,43 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				paper_key = 'letter'
 			paper_width, paper_height = paper_sizes[paper_key]
 
-			cdp_session = await browser_session.get_or_create_cdp_session(focus=True)
+			if browser_session.is_safari:
+				try:
+					pdf_bytes = await browser_session.require_browser_backend().print_to_pdf(
+						{
+							'background': params.print_background,
+							'orientation': 'landscape' if params.landscape else 'portrait',
+							'scale': params.scale,
+							'page': {
+								'width': paper_width,
+								'height': paper_height,
+							},
+						}
+					)
+				except NotImplementedError as e:
+					return ActionResult(error=str(e))
+			else:
+				cdp_session = await browser_session.get_or_create_cdp_session(focus=True)
 
-			result = await asyncio.wait_for(
-				cdp_session.cdp_client.send.Page.printToPDF(
-					params={
-						'printBackground': params.print_background,
-						'landscape': params.landscape,
-						'scale': params.scale,
-						'paperWidth': paper_width,
-						'paperHeight': paper_height,
-						'preferCSSPageSize': True,
-					},
-					session_id=cdp_session.session_id,
-				),
-				timeout=30.0,
-			)
+				result = await asyncio.wait_for(
+					cdp_session.cdp_client.send.Page.printToPDF(
+						params={
+							'printBackground': params.print_background,
+							'landscape': params.landscape,
+							'scale': params.scale,
+							'paperWidth': paper_width,
+							'paperHeight': paper_height,
+							'preferCSSPageSize': True,
+						},
+						session_id=cdp_session.session_id,
+					),
+					timeout=30.0,
+				)
 
-			pdf_data = result.get('data')
-			assert pdf_data, 'CDP Page.printToPDF returned no data'
+				pdf_data = result.get('data')
+				assert pdf_data, 'CDP Page.printToPDF returned no data'
 
-			pdf_bytes = base64.b64decode(pdf_data)
+				pdf_bytes = base64.b64decode(pdf_data)
 
 			# Determine filename
 			if params.file_name:
@@ -1763,45 +1802,58 @@ You will be given a query and the markdown of a webpage that has been filtered t
 		async def evaluate(code: str, browser_session: BrowserSession):
 			# Execute JavaScript with proper error handling and promise support
 
-			cdp_session = await browser_session.get_or_create_cdp_session()
-
 			try:
 				# Validate and potentially fix JavaScript code before execution
 				validated_code = self._validate_and_fix_javascript(code)
 
-				# Always use awaitPromise=True - it's ignored for non-promises
-				result = await cdp_session.cdp_client.send.Runtime.evaluate(
-					params={'expression': validated_code, 'returnByValue': True, 'awaitPromise': True},
-					session_id=cdp_session.session_id,
-				)
+				if browser_session.is_safari:
+					value = await browser_session.require_browser_backend().evaluate(validated_code, await_promise=True)
+					if isinstance(value, dict) and value.get('error'):
+						enhanced_msg = f"""JavaScript Execution Failed:
+{value.get('error')}
 
-				# Check for JavaScript execution errors
-				if result.get('exceptionDetails'):
-					exception = result['exceptionDetails']
-					error_msg = f'JavaScript execution error: {exception.get("text", "Unknown error")}'
+Validated Code (after quote fixing):
+{validated_code[:500]}{'...' if len(validated_code) > 500 else ''}
+"""
+						logger.debug(enhanced_msg)
+						return ActionResult(error=enhanced_msg)
+					result_data = {'value': value}
+				else:
+					cdp_session = await browser_session.get_or_create_cdp_session()
 
-					# Enhanced error message with debugging info
-					enhanced_msg = f"""JavaScript Execution Failed:
+					# Always use awaitPromise=True - it's ignored for non-promises
+					result = await cdp_session.cdp_client.send.Runtime.evaluate(
+						params={'expression': validated_code, 'returnByValue': True, 'awaitPromise': True},
+						session_id=cdp_session.session_id,
+					)
+
+					# Check for JavaScript execution errors
+					if result.get('exceptionDetails'):
+						exception = result['exceptionDetails']
+						error_msg = f'JavaScript execution error: {exception.get("text", "Unknown error")}'
+
+						# Enhanced error message with debugging info
+						enhanced_msg = f"""JavaScript Execution Failed:
 {error_msg}
 
 Validated Code (after quote fixing):
 {validated_code[:500]}{'...' if len(validated_code) > 500 else ''}
 """
 
-					logger.debug(enhanced_msg)
-					return ActionResult(error=enhanced_msg)
+						logger.debug(enhanced_msg)
+						return ActionResult(error=enhanced_msg)
 
-				# Get the result data
-				result_data = result.get('result', {})
+					# Get the result data
+					result_data = result.get('result', {})
 
-				# Check for wasThrown flag (backup error detection)
-				if result_data.get('wasThrown'):
-					msg = f'JavaScript code: {code} execution failed (wasThrown=true)'
-					logger.debug(msg)
-					return ActionResult(error=msg)
+					# Check for wasThrown flag (backup error detection)
+					if result_data.get('wasThrown'):
+						msg = f'JavaScript code: {code} execution failed (wasThrown=true)'
+						logger.debug(msg)
+						return ActionResult(error=msg)
 
-				# Get the actual value
-				value = result_data.get('value')
+					# Get the actual value
+					value = result_data.get('value')
 
 				# Handle different value types
 				if value is None:

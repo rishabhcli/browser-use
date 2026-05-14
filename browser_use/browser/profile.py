@@ -321,6 +321,14 @@ class BrowserChannel(str, Enum):
 	MSEDGE_BETA = 'msedge-beta'
 	MSEDGE_DEV = 'msedge-dev'
 	MSEDGE_CANARY = 'msedge-canary'
+	SAFARI = 'safari'
+	SAFARI_TECHNOLOGY_PREVIEW = 'safari-technology-preview'
+	TECHNOLOGY_PREVIEW = 'technology-preview'
+
+
+class BrowserEngine(str, Enum):
+	CHROMIUM = 'chromium'
+	SAFARI = 'safari'
 
 
 # Using constants from central location in browser_use.config
@@ -595,6 +603,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	# BrowserLaunchPersistentContextArgs, BrowserLaunchArgs, BrowserNewContextArgs, BrowserConnectArgs
 
 	# Session/connection configuration
+	engine: BrowserEngine = Field(default=BrowserEngine.CHROMIUM, description='Browser engine backend to use.')
 	cdp_url: str | None = Field(default=None, description='CDP URL for connecting to existing browser instance')
 	is_local: bool = Field(default=False, description='Whether this is a local browser instance')
 	use_cloud: bool = Field(

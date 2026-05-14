@@ -174,6 +174,9 @@ class BaseWatchdog(BaseModel):
 						f'🚌 {watchdog_and_handler_str} ❌ Failed ({time_elapsed:.2f}s): {type(e).__name__}: {e}'
 					)
 
+					if browser_session.is_safari:
+						raise
+
 					# attempt to repair potentially crashed CDP session
 					try:
 						if browser_session.agent_focus_target_id:

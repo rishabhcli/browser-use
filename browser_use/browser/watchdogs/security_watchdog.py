@@ -64,8 +64,13 @@ class SecurityWatchdog(BaseWatchdog):
 			# Navigate to about:blank to keep session alive
 			# Agent will see the error and can continue with other tasks
 			try:
-				session = await self.browser_session.get_or_create_cdp_session(target_id=event.target_id)
-				await session.cdp_client.send.Page.navigate(params={'url': 'about:blank'}, session_id=session.session_id)
+				if self.browser_session.is_safari:
+					backend = self.browser_session.require_browser_backend()
+					await backend.switch_tab(event.target_id)
+					await backend.navigate('about:blank')
+				else:
+					session = await self.browser_session.get_or_create_cdp_session(target_id=event.target_id)
+					await session.cdp_client.send.Page.navigate(params={'url': 'about:blank'}, session_id=session.session_id)
 				self.logger.info(f'⛔️ Navigated to about:blank after blocked URL: {event.url}')
 			except Exception as e:
 				self.logger.error(f'⛔️ Failed to navigate to about:blank: {type(e).__name__} {e}')
@@ -86,7 +91,10 @@ class SecurityWatchdog(BaseWatchdog):
 
 			# Try to close the offending tab
 			try:
-				await self.browser_session._cdp_close_page(event.target_id)
+				if self.browser_session.is_safari:
+					await self.browser_session.require_browser_backend().close_tab(event.target_id)
+				else:
+					await self.browser_session._cdp_close_page(event.target_id)
 				self.logger.info(f'⛔️ Closed new tab with non-allowed URL: {event.url}')
 			except Exception as e:
 				self.logger.error(f'⛔️ Failed to close new tab with non-allowed URL: {type(e).__name__} {e}')

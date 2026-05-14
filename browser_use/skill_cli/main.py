@@ -681,6 +681,11 @@ Setup:
 	# doctor
 	subparsers.add_parser('doctor', help='Check browser-use installation and dependencies')
 
+	# safari doctor
+	safari_p = subparsers.add_parser('safari', help='Safari backend diagnostics and tools')
+	safari_sub = safari_p.add_subparsers(dest='safari_command')
+	safari_sub.add_parser('doctor', help='Check Safari WebDriver support')
+
 	# connect (to local Chrome)
 	subparsers.add_parser('connect', help='Connect to running Chrome via CDP')
 
@@ -1282,6 +1287,35 @@ def main() -> int:
 					val = entry['value'] if entry['value'] else 'not set'
 				print(f'  {icon} {entry["key"]}: {val}')
 			print(f'  Docs: {CLI_DOCS_URL}')
+
+		return 0
+
+	# Handle Safari diagnostics
+	if args.command == 'safari':
+		if args.safari_command != 'doctor':
+			print('Error: safari requires a subcommand. Try: browser-use safari doctor', file=sys.stderr)
+			return 1
+
+		from browser_use.browser.backends.safari import run_safari_doctor
+
+		result = asyncio.run(run_safari_doctor())
+		if args.json:
+			print(json.dumps(result))
+		else:
+			print('\nSafari Diagnostics:\n')
+			for name, check in result.get('checks', {}).items():
+				status = check.get('status', 'unknown')
+				message = check.get('message', '')
+				fix = check.get('fix', '')
+				icon = '✓' if status == 'ok' else '○' if status == 'missing' else '✗'
+				print(f'  {icon} {name}: {message}')
+				if fix:
+					print(f'      Fix: {fix}')
+			print('')
+			if result.get('status') == 'healthy':
+				print('✓ Safari checks passed!')
+			else:
+				print(f'⚠ {result.get("summary", "Some Safari checks need attention")}')
 
 		return 0
 

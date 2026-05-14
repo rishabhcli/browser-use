@@ -355,10 +355,7 @@ class Registry(Generic[Context]):
 				current_url = None
 				if browser_session and browser_session.agent_focus_target_id:
 					try:
-						# Get current page info from session_manager
-						target = browser_session.session_manager.get_target(browser_session.agent_focus_target_id)
-						if target:
-							current_url = target.url
+						current_url = await browser_session.get_current_page_url()
 					except Exception:
 						pass
 				validated_params = self._replace_sensitive_data(validated_params, sensitive_data, current_url)
@@ -385,8 +382,11 @@ class Registry(Generic[Context]):
 				except Exception:
 					special_context['page_url'] = None
 
-				# Add cdp_client
-				special_context['cdp_client'] = browser_session.cdp_client
+				# Add cdp_client when the active backend exposes CDP.
+				try:
+					special_context['cdp_client'] = browser_session.cdp_client
+				except Exception:
+					special_context['cdp_client'] = None
 
 			# All functions are now normalized to accept kwargs only
 			# Call with params and unpacked special context
