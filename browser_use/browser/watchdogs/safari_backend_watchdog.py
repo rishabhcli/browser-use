@@ -149,7 +149,10 @@ class SafariBackendWatchdog(BaseWatchdog):
 		path = event.path or self.browser_session.browser_profile.storage_state
 		if not path:
 			return None
-		state = await self.safari_backend.load_storage_state(path if isinstance(path, dict) else str(path))
+		state = await self.safari_backend.load_storage_state(
+			path if isinstance(path, dict) else str(path),
+			defer_until_navigation=isinstance(path, dict),
+		)
 		self.event_bus.dispatch(
 			StorageStateLoadedEvent(
 				path=str(path),

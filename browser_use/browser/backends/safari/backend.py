@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from browser_use.browser.backends.base import BrowserStartResult, NavigationResult
 from browser_use.browser.backends.capabilities import BrowserCapabilities
@@ -55,35 +56,51 @@ class SafariBrowserBackend:
 			keep_alive=bool(profile.keep_alive),
 		)
 		self.profile = profile
-		self.client = SafariWebDriverClient(config)
+		self.config = config
+		self.client = SafariWebDriverClient(self.config)
 		self.dom_engine = SafariDomEngine(self.client)
 		self._last_state: BrowserStateSummary | None = None
+		self._pending_storage_state: dict[str, Any] | None = None
 
 	async def start(self) -> BrowserStartResult:
 		"""Start safaridriver, create a session, and focus the first window."""
-		await self.client.start_driver()
-		capabilities = await self.client.create_session()
-		self.capabilities = self._capabilities_from_session(capabilities)
-		await self._hide_browser_app_if_background()
+		last_error: BaseException | None = None
+		for attempt in range(3):
+			try:
+				await self.client.start_driver()
+				capabilities = await self.client.create_session()
+				self.capabilities = self._capabilities_from_session(capabilities)
+				await self._hide_browser_app_if_background()
 
-		if self.profile.window_size:
-			await self._set_window_rect(
-				width=self.profile.window_size.width,
-				height=self.profile.window_size.height,
-				x=self.profile.window_position.width if self.profile.window_position else None,
-				y=self.profile.window_position.height if self.profile.window_position else None,
-			)
-			await self._hide_browser_app_if_background()
+				if self.profile.window_size:
+					await self._set_window_rect(
+						width=self.profile.window_size.width,
+						height=self.profile.window_size.height,
+						x=self.profile.window_position.width if self.profile.window_position else None,
+						y=self.profile.window_position.height if self.profile.window_position else None,
+					)
+					await self._hide_browser_app_if_background()
 
-		handles = await self.client.window_handles()
-		if not handles:
-			raise RuntimeError('Safari WebDriver session has no window handles')
-		await self.client.switch_to_window(handles[0])
-		return BrowserStartResult(
-			connection_url=self.client.base_url,
-			target_id=handles[0],
-			capabilities=self.capabilities,
-		)
+				handles = await self.client.window_handles()
+				if not handles:
+					raise RuntimeError('Safari WebDriver session has no window handles')
+				await self.client.switch_to_window(handles[0])
+				return BrowserStartResult(
+					connection_url=self.client.base_url,
+					target_id=handles[0],
+					capabilities=self.capabilities,
+				)
+			except Exception as exc:
+				last_error = exc
+				with contextlib.suppress(Exception):
+					await self.client.close(force=True)
+				if attempt < 2:
+					await asyncio.sleep(1.0)
+					self.client = SafariWebDriverClient(self.config)
+					self.dom_engine = SafariDomEngine(self.client)
+
+		assert last_error is not None
+		raise last_error
 
 	async def stop(self, force: bool = False) -> None:
 		await self.client.close(force=force)
@@ -144,6 +161,7 @@ class SafariBrowserBackend:
 		else:
 			await self.client.navigate(url)
 			await self._wait_for_ready_state()
+		await self._apply_pending_storage_state_for_current_origin()
 		await self._hide_browser_app_if_background()
 		self._last_state = None
 		return NavigationResult(url=await self.client.current_url())
@@ -170,9 +188,15 @@ class SafariBrowserBackend:
 		previous_dom = self._last_state.dom_state if self._last_state else None
 		dom_state = SerializedDOMState(_root=None, selector_map={})
 		page_info_data: dict[str, Any] = {}
+		browser_errors: list[str] = []
 		if include_dom:
 			dom_state, page_info_data = await self.dom_engine.get_serialized_dom_tree(previous_dom)
-		screenshot = await self.screenshot() if include_screenshot else None
+		screenshot = None
+		if include_screenshot:
+			try:
+				screenshot = await self.screenshot()
+			except Exception as exc:
+				browser_errors.append(f'Safari screenshot unavailable: {type(exc).__name__}: {exc}')
 		tabs = await self.get_tabs()
 		url = await self.client.current_url()
 		title = await self.client.title()
@@ -187,7 +211,7 @@ class SafariBrowserBackend:
 			page_info=page_info,
 			pixels_above=page_info.pixels_above if page_info else 0,
 			pixels_below=page_info.pixels_below if page_info else 0,
-			browser_errors=[],
+			browser_errors=browser_errors,
 			is_pdf_viewer=url.lower().endswith('.pdf'),
 			pending_network_requests=[],
 			pagination_buttons=[],
@@ -239,7 +263,16 @@ class SafariBrowserBackend:
 	async def screenshot(self, full_page: bool = False, clip: dict | None = None) -> str:
 		if full_page or clip:
 			return await self._stitched_screenshot(clip=clip if clip else None)
-		return await self.client.screenshot_base64()
+		last_error: BaseException | None = None
+		for attempt in range(3):
+			try:
+				return await self.client.screenshot_base64()
+			except Exception as exc:
+				last_error = exc
+				if attempt < 2:
+					await asyncio.sleep(0.5)
+		assert last_error is not None
+		raise last_error
 
 	async def screenshot_bytes(self, full_page: bool = False, clip: dict | None = None) -> bytes:
 		return base64.b64decode(await self.screenshot(full_page=full_page, clip=clip))
@@ -259,10 +292,7 @@ class SafariBrowserBackend:
 		selector = self._selector_for_node(node)
 		try:
 			element_id = await self._find_element(selector)
-			try:
-				await self.client.click_element(element_id)
-			except WebDriverError:
-				await self.client.execute_script('arguments[0].click();', [{self._webdriver_element_key(): element_id}])
+			await self._activate_element(element_id)
 		except WebDriverError:
 			click_result = await self._deep_click(selector)
 			if not click_result.get('clicked'):
@@ -701,7 +731,9 @@ class SafariBrowserBackend:
 			json_path.write_text(json.dumps(storage_state, indent=2, ensure_ascii=False), encoding='utf-8')
 		return storage_state
 
-	async def load_storage_state(self, path_or_state: str | dict[str, Any]) -> dict[str, Any]:
+	async def load_storage_state(
+		self, path_or_state: str | dict[str, Any], defer_until_navigation: bool = False
+	) -> dict[str, Any]:
 		if isinstance(path_or_state, dict):
 			storage_state = path_or_state
 		else:
@@ -709,6 +741,9 @@ class SafariBrowserBackend:
 			if not json_path.exists():
 				return {'cookies': [], 'origins': []}
 			storage_state = json.loads(json_path.read_text(encoding='utf-8'))
+		if defer_until_navigation:
+			self._pending_storage_state = storage_state
+			return storage_state
 		original_url = await self.client.current_url()
 		try:
 			for origin in storage_state.get('origins', []):
@@ -887,7 +922,9 @@ class SafariBrowserBackend:
 		await self.client._session_request('POST', '/window/rect', json=payload)
 
 	async def _hide_browser_app_if_background(self) -> None:
-		if self.profile.headless is False:
+		import os
+
+		if self.profile.headless is not True and os.getenv('BROWSER_USE_SAFARI_BACKGROUND') != '1':
 			return
 		process_name = self.client.config.browser_name
 		script = f'tell application "System Events" to if exists process "{process_name}" then set visible of process "{process_name}" to false'
@@ -917,6 +954,17 @@ class SafariBrowserBackend:
 
 	def _is_file_input(self, node: EnhancedDOMTreeNode) -> bool:
 		return (node.tag_name or '').lower() == 'input' and node.attributes.get('type', '').lower() == 'file'
+
+	async def _activate_element(self, element_id: str) -> None:
+		await self.client.execute_script(
+			"""
+			const element = arguments[0];
+			element.scrollIntoView?.({block: 'center', inline: 'center'});
+			element.focus?.();
+			element.click?.();
+			""",
+			[{self._webdriver_element_key(): element_id}],
+		)
 
 	async def _find_element(self, selector: str) -> str:
 		try:
@@ -1084,6 +1132,48 @@ class SafariBrowserBackend:
 		scheme = 'https' if cookie.get('secure') else 'http'
 		path = str(cookie.get('path') or '/')
 		return f'{scheme}://{domain}{path if path.startswith("/") else "/" + path}'
+
+	async def _apply_pending_storage_state_for_current_origin(self) -> None:
+		if not self._pending_storage_state:
+			return
+		current_origin = await self._current_origin()
+		if not current_origin:
+			return
+
+		applied = False
+		for origin in self._pending_storage_state.get('origins', []):
+			if origin.get('origin') != current_origin:
+				continue
+			await self.client.execute_script(
+				"""
+				const localItems = arguments[0] || [];
+				const sessionItems = arguments[1] || [];
+				for (const item of localItems) window.localStorage.setItem(item.name, item.value);
+				for (const item of sessionItems) window.sessionStorage.setItem(item.name, item.value);
+				""",
+				[origin.get('localStorage') or [], origin.get('sessionStorage') or []],
+			)
+			applied = True
+
+		for cookie in self._pending_storage_state.get('cookies', []):
+			if self._cookie_matches_origin(cookie, current_origin):
+				with contextlib.suppress(Exception):
+					await self.client.add_cookie(self._webdriver_cookie(cookie))
+					applied = True
+
+		if applied:
+			self._pending_storage_state = None
+
+	async def _current_origin(self) -> str | None:
+		origin = await self.client.execute_script(
+			'return window.location.origin && window.location.origin !== "null" ? window.location.origin : null;'
+		)
+		return str(origin) if origin else None
+
+	def _cookie_matches_origin(self, cookie: dict[str, Any], origin: str) -> bool:
+		origin_host = urlparse(origin).hostname or ''
+		cookie_domain = str(cookie.get('domain') or '').lstrip('.')
+		return bool(cookie_domain and (origin_host == cookie_domain or origin_host.endswith(f'.{cookie_domain}')))
 
 	def _page_info_from_payload(self, payload: dict[str, Any]) -> PageInfo | None:
 		if not payload:

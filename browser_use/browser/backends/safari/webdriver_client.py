@@ -43,7 +43,7 @@ class SafariDriverConfig(BaseModel):
 		executable_path: str | Path | None = None,
 		env: dict[str, str | float | bool] | None = None,
 		keep_alive: bool = False,
-	) -> 'SafariDriverConfig':
+	) -> SafariDriverConfig:
 		"""Create a driver config from BrowserProfile channel/executable fields."""
 		driver_path = Path(executable_path).expanduser() if executable_path else None
 		channel_value = (channel or '').lower()

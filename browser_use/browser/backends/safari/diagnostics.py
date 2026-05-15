@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,26 @@ def _driver_check(path: Path) -> dict[str, Any]:
 
 
 async def _session_probe(driver_path: Path, browser_name: str) -> dict[str, Any]:
+	last_error: Exception | None = None
+	for attempt in range(3):
+		result = await _session_probe_once(driver_path, browser_name)
+		if result.get('status') == 'ok':
+			return result
+		last_error = result.get('exception') if isinstance(result.get('exception'), Exception) else last_error
+		if attempt < 2:
+			await asyncio.sleep(1.0)
+
+	message = f'{browser_name} WebDriver probe failed'
+	if last_error:
+		message += f': {type(last_error).__name__}: {last_error}'
+	return {
+		'status': 'error',
+		'message': message,
+		'fix': 'Enable Safari remote automation if needed: Safari > Settings > Advanced > Show features for web developers, then Develop > Allow Remote Automation.',
+	}
+
+
+async def _session_probe_once(driver_path: Path, browser_name: str) -> dict[str, Any]:
 	client = SafariWebDriverClient(
 		SafariDriverConfig(driver_path=driver_path, browser_name=browser_name, start_timeout=8.0, request_timeout=8.0)
 	)
@@ -82,6 +103,7 @@ async def _session_probe(driver_path: Path, browser_name: str) -> dict[str, Any]
 		return {
 			'status': 'error',
 			'message': f'{browser_name} WebDriver probe failed: {type(exc).__name__}: {exc}',
+			'exception': exc,
 			'fix': 'Enable Safari remote automation if needed: Safari > Settings > Advanced > Show features for web developers, then Develop > Allow Remote Automation.',
 		}
 	finally:
